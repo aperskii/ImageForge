@@ -63,16 +63,25 @@ func run() error {
 	}
 	defer set.Close()
 
+	issuer, err := newIssuer(logger, cfg)
+	if err != nil {
+		return err
+	}
+
 	api := httpapi.New(
 		usecase.NewCreateJob(set.Storage, set.Jobs, set.Queue),
 		set.Jobs,
+		issuer,
 		httpapi.Config{
 			Logger:         logger,
 			MaxUploadBytes: cfg.maxUploadBytes,
 			AllowedOrigins: cfg.corsOrigins,
 			PublicBaseURL:  cfg.publicBaseURL,
+			RateLimit:      cfg.rateLimit,
+			RateBurst:      cfg.rateBurst,
 		},
 	)
+	defer api.Close()
 
 	server := &http.Server{
 		Addr:              cfg.addr,
@@ -127,6 +136,11 @@ func run() error {
 // config holds the runtime settings, all overridable by environment variable.
 type config struct {
 	backend        string
+	signingKey     string
+	clientSecret   string
+	tokenTTL       time.Duration
+	rateLimit      float64
+	rateBurst      int
 	addr           string
 	storageDir     string
 	publicBaseURL  string
@@ -141,6 +155,11 @@ type config struct {
 func loadConfig() config {
 	cfg := config{
 		backend:        adapters.BackendFromEnv(),
+		signingKey:     envString("IMAGEFORGE_JWT_KEY", ""),
+		clientSecret:   envString("IMAGEFORGE_CLIENT_SECRET", ""),
+		tokenTTL:       envDuration("IMAGEFORGE_TOKEN_TTL", httpapi.DefaultTokenTTL),
+		rateLimit:      float64(envInt64("IMAGEFORGE_RATE_LIMIT", httpapi.DefaultRateLimit)),
+		rateBurst:      int(envInt64("IMAGEFORGE_RATE_BURST", httpapi.DefaultRateBurst)),
 		addr:           envString("IMAGEFORGE_ADDR", ":8080"),
 		storageDir:     envString("IMAGEFORGE_STORAGE_DIR", ".data/storage"),
 		publicBaseURL:  envString("IMAGEFORGE_PUBLIC_BASE_URL", ""),
@@ -197,4 +216,62 @@ func envLogLevel(key string, fallback slog.Level) slog.Level {
 		return fallback
 	}
 	return level
+}
+
+// newIssuer builds the token issuer from configuration.
+//
+// A signing key given in the environment is used as-is. With none configured a
+// random one is generated for this process, which means tokens do not survive a
+// restart -- the right trade for a demo, because an ephemeral key nobody knows
+// is safer than a default key that ships in the source and ends up in
+// production. Either way the operator is told which happened.
+func newIssuer(logger *slog.Logger, cfg config) (*httpapi.TokenIssuer, error) {
+	var (
+		key []byte
+		err error
+	)
+
+	switch {
+	case cfg.signingKey != "":
+		if key, err = httpapi.ParseKey(cfg.signingKey); err != nil {
+			return nil, fmt.Errorf("auth: %w", err)
+		}
+		logger.Info("signing tokens with the configured key")
+	default:
+		if key, err = httpapi.GenerateKey(); err != nil {
+			return nil, fmt.Errorf("auth: %w", err)
+		}
+		logger.Warn("no signing key configured, generating an ephemeral one",
+			slog.String("consequence", "tokens issued now stop working when this process restarts"),
+			slog.String("fix", "set IMAGEFORGE_JWT_KEY to 32 hex-encoded bytes"))
+	}
+
+	if cfg.clientSecret == "" {
+		logger.Warn("no client secret configured, so any client id will be issued a token",
+			slog.String("fix", "set IMAGEFORGE_CLIENT_SECRET to require one"))
+	}
+
+	issuer, err := httpapi.NewIssuer(key,
+		httpapi.WithTokenTTL(cfg.tokenTTL),
+		httpapi.WithClientSecret(cfg.clientSecret))
+	if err != nil {
+		return nil, fmt.Errorf("auth: %w", err)
+	}
+	return issuer, nil
+}
+
+// envDuration returns the environment value for key as a duration, accepting
+// any form time.ParseDuration does.
+func envDuration(key string, fallback time.Duration) time.Duration {
+	raw, ok := os.LookupEnv(key)
+	if !ok {
+		return fallback
+	}
+	v, err := time.ParseDuration(raw)
+	if err != nil {
+		slog.Warn("ignoring an unparseable duration",
+			slog.String("key", key), slog.String("value", raw))
+		return fallback
+	}
+	return v
 }

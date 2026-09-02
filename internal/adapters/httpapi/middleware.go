@@ -85,8 +85,8 @@ func recoverer(logger *slog.Logger) func(http.Handler) http.Handler {
 					slog.Any("panic", recovered),
 					slog.String("stack", string(debug.Stack())))
 
-				writeError(w, r, http.StatusInternalServerError, codeInternal,
-					"the server encountered an unexpected condition")
+				writeProblem(w, r, http.StatusInternalServerError, TypeInternal,
+					"Internal Server Error", "The server encountered an unexpected condition.")
 			}()
 
 			next.ServeHTTP(w, r)

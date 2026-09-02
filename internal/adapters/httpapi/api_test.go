@@ -30,6 +30,7 @@ const validSpec = `{"width":800,"height":600,"format":"webp","quality":82,"strip
 // themselves so tests can assert on the side effects.
 type testStack struct {
 	server  *httptest.Server
+	token   string
 	storage *localstorage.Storage
 	queue   *memqueue.Queue
 	jobs    *memrepo.JobRepository
@@ -52,11 +53,18 @@ func newTestStack(t *testing.T, cfg Config) *testStack {
 		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 
-	api := New(usecase.NewCreateJob(storage, jobs, queue), jobs, cfg)
+	issuer, err := NewIssuer(testKey)
+	require.NoError(t, err)
+
+	api := New(usecase.NewCreateJob(storage, jobs, queue), jobs, issuer, cfg)
+	t.Cleanup(api.Close)
 	server := httptest.NewServer(api.Routes())
 	t.Cleanup(server.Close)
 
-	return &testStack{server: server, storage: storage, queue: queue, jobs: jobs}
+	token, err := issuer.Issue(testClientID)
+	require.NoError(t, err)
+
+	return &testStack{server: server, token: token, storage: storage, queue: queue, jobs: jobs}
 }
 
 // multipartBody builds an upload body. A file part is omitted when fileField is
@@ -93,12 +101,30 @@ func decodeJob(t *testing.T, body io.Reader) jobResponse {
 	return job
 }
 
-// decodeError decodes an error response.
-func decodeError(t *testing.T, body io.Reader) errorResponse {
+// post sends an authenticated POST.
+func (s *testStack) post(t *testing.T, path, contentType string, body io.Reader) *http.Response {
 	t.Helper()
 
-	var resp errorResponse
-	require.NoError(t, json.NewDecoder(body).Decode(&resp))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, s.server.URL+path, body)
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Authorization", "Bearer "+s.token)
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	return resp
+}
+
+// get sends an authenticated GET.
+func (s *testStack) get(t *testing.T, path string) *http.Response {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, s.server.URL+path, http.NoBody)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+s.token)
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
 	return resp
 }
 
@@ -144,10 +170,9 @@ func TestPostUploadsSuccess(t *testing.T) {
 			t.Parallel()
 
 			stack := newTestStack(t, Config{PublicBaseURL: tt.publicBase})
-			body, contentType := multipartBody(t, FileField, "photo.png", "image-bytes", SpecField, tt.spec)
+			body, contentType := multipartBody(t, FileField, "photo.png", string(pngBytes(t)), SpecField, tt.spec)
 
-			resp, err := http.Post(stack.server.URL+"/uploads", contentType, body)
-			require.NoError(t, err)
+			resp := stack.post(t, "/uploads", contentType, body)
 			defer func() { _ = resp.Body.Close() }()
 
 			require.Equal(t, http.StatusAccepted, resp.StatusCode)
@@ -174,7 +199,7 @@ func TestPostUploadsSuccess(t *testing.T) {
 			defer func() { _ = object.Close() }()
 			content, err := io.ReadAll(object)
 			require.NoError(t, err)
-			assert.Equal(t, "image-bytes", string(content), "the uploaded bytes reach storage unchanged")
+			assert.Equal(t, pngBytes(t), content, "the uploaded bytes reach storage unchanged")
 
 			assert.Equal(t, 1, stack.queue.Len(), "the job was enqueued exactly once")
 		})
@@ -190,77 +215,77 @@ func TestPostUploadsValidationErrors(t *testing.T) {
 		specField  string
 		spec       string
 		wantStatus int
-		wantCode   string
+		wantType   string
 	}{
 		{
 			name:      "missing file part",
 			fileField: "", specField: SpecField, spec: validSpec,
-			wantStatus: http.StatusBadRequest, wantCode: codeMissingFile,
+			wantStatus: http.StatusBadRequest, wantType: TypeMissingFile,
 		},
 		{
 			name:      "file under the wrong field name",
 			fileField: "upload", specField: SpecField, spec: validSpec,
-			wantStatus: http.StatusBadRequest, wantCode: codeMissingFile,
+			wantStatus: http.StatusBadRequest, wantType: TypeMissingFile,
 		},
 		{
 			name:      "missing spec part",
 			fileField: FileField, specField: "",
-			wantStatus: http.StatusBadRequest, wantCode: codeInvalidSpec,
+			wantStatus: http.StatusBadRequest, wantType: TypeInvalidSpec,
 		},
 		{
 			name:      "empty spec part",
 			fileField: FileField, specField: SpecField, spec: "",
-			wantStatus: http.StatusBadRequest, wantCode: codeInvalidSpec,
+			wantStatus: http.StatusBadRequest, wantType: TypeInvalidSpec,
 		},
 		{
 			name:      "spec is not json",
 			fileField: FileField, specField: SpecField, spec: "not json",
-			wantStatus: http.StatusBadRequest, wantCode: codeInvalidSpec,
+			wantStatus: http.StatusBadRequest, wantType: TypeInvalidSpec,
 		},
 		{
 			name:      "spec has an unknown field",
 			fileField: FileField, specField: SpecField, spec: `{"width":800,"format":"png","rotate":90}`,
-			wantStatus: http.StatusBadRequest, wantCode: codeInvalidSpec,
+			wantStatus: http.StatusBadRequest, wantType: TypeInvalidSpec,
 		},
 		{
 			name:      "spec has a wrongly typed field",
 			fileField: FileField, specField: SpecField, spec: `{"width":"800","format":"png"}`,
-			wantStatus: http.StatusBadRequest, wantCode: codeInvalidSpec,
+			wantStatus: http.StatusBadRequest, wantType: TypeInvalidSpec,
 		},
 		{
 			name:      "no dimension requested",
 			fileField: FileField, specField: SpecField, spec: `{"format":"png"}`,
-			wantStatus: http.StatusBadRequest, wantCode: codeInvalidTransformation,
+			wantStatus: http.StatusBadRequest, wantType: TypeInvalidTransform,
 		},
 		{
 			name:      "negative dimension",
 			fileField: FileField, specField: SpecField, spec: `{"width":-10,"format":"png"}`,
-			wantStatus: http.StatusBadRequest, wantCode: codeInvalidTransformation,
+			wantStatus: http.StatusBadRequest, wantType: TypeInvalidTransform,
 		},
 		{
 			name:      "dimension above the maximum",
 			fileField: FileField, specField: SpecField, spec: `{"width":10001,"format":"png"}`,
-			wantStatus: http.StatusBadRequest, wantCode: codeInvalidTransformation,
+			wantStatus: http.StatusBadRequest, wantType: TypeInvalidTransform,
 		},
 		{
 			name:      "unsupported format",
 			fileField: FileField, specField: SpecField, spec: `{"width":800,"format":"gif"}`,
-			wantStatus: http.StatusBadRequest, wantCode: codeInvalidTransformation,
+			wantStatus: http.StatusBadRequest, wantType: TypeInvalidTransform,
 		},
 		{
 			name:      "missing format",
 			fileField: FileField, specField: SpecField, spec: `{"width":800}`,
-			wantStatus: http.StatusBadRequest, wantCode: codeInvalidTransformation,
+			wantStatus: http.StatusBadRequest, wantType: TypeInvalidTransform,
 		},
 		{
 			name:      "quality out of range",
 			fileField: FileField, specField: SpecField, spec: `{"width":800,"format":"jpeg","quality":101}`,
-			wantStatus: http.StatusBadRequest, wantCode: codeInvalidTransformation,
+			wantStatus: http.StatusBadRequest, wantType: TypeInvalidTransform,
 		},
 		{
 			name:      "quality set on a lossless format",
 			fileField: FileField, specField: SpecField, spec: `{"width":800,"format":"png","quality":80}`,
-			wantStatus: http.StatusBadRequest, wantCode: codeInvalidTransformation,
+			wantStatus: http.StatusBadRequest, wantType: TypeInvalidTransform,
 		},
 	}
 
@@ -269,18 +294,17 @@ func TestPostUploadsValidationErrors(t *testing.T) {
 			t.Parallel()
 
 			stack := newTestStack(t, Config{})
-			body, contentType := multipartBody(t, tt.fileField, "photo.png", "image-bytes", tt.specField, tt.spec)
+			body, contentType := multipartBody(t, tt.fileField, "photo.png", string(pngBytes(t)), tt.specField, tt.spec)
 
-			resp, err := http.Post(stack.server.URL+"/uploads", contentType, body)
-			require.NoError(t, err)
+			resp := stack.post(t, "/uploads", contentType, body)
 			defer func() { _ = resp.Body.Close() }()
 
 			require.Equal(t, tt.wantStatus, resp.StatusCode)
 
-			errResp := decodeError(t, resp.Body)
-			assert.Equal(t, tt.wantCode, errResp.Error.Code)
-			assert.NotEmpty(t, errResp.Error.Message)
-			assert.NotEmpty(t, errResp.Error.RequestID, "errors carry the request id")
+			problem := decodeProblem(t, resp)
+			assert.Equal(t, tt.wantType, problem.Type)
+			assert.NotEmpty(t, problem.Detail)
+			assert.NotEmpty(t, problem.RequestID, "errors carry the request id")
 
 			// A rejected upload leaves no trace behind.
 			assert.Zero(t, stack.jobs.Len(), "no job is persisted")
@@ -294,12 +318,11 @@ func TestPostUploadsRejectsNonMultipart(t *testing.T) {
 
 	stack := newTestStack(t, Config{})
 
-	resp, err := http.Post(stack.server.URL+"/uploads", "application/json", strings.NewReader(validSpec))
-	require.NoError(t, err)
+	resp := stack.post(t, "/uploads", "application/json", strings.NewReader(validSpec))
 	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
-	assert.Equal(t, codeInvalidMultipart, decodeError(t, resp.Body).Error.Code)
+	assert.Equal(t, TypeInvalidMultipart, decodeProblem(t, resp).Type)
 }
 
 func TestPostUploadsRejectsOversizedBody(t *testing.T) {
@@ -307,17 +330,16 @@ func TestPostUploadsRejectsOversizedBody(t *testing.T) {
 
 	const limit = 1 << 10
 	stack := newTestStack(t, Config{MaxUploadBytes: limit})
-	body, contentType := multipartBody(t, FileField, "big.png", strings.Repeat("x", 4*limit), SpecField, validSpec)
+	body, contentType := multipartBody(t, FileField, "big.png", string(pngBytes(t))+strings.Repeat("x", 8*limit), SpecField, validSpec)
 
-	resp, err := http.Post(stack.server.URL+"/uploads", contentType, body)
-	require.NoError(t, err)
+	resp := stack.post(t, "/uploads", contentType, body)
 	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusRequestEntityTooLarge, resp.StatusCode)
 
-	errResp := decodeError(t, resp.Body)
-	assert.Equal(t, codePayloadTooLarge, errResp.Error.Code)
-	assert.Contains(t, errResp.Error.Message, fmt.Sprint(limit), "the limit is stated in the message")
+	problem := decodeProblem(t, resp)
+	assert.Equal(t, TypePayloadTooLarge, problem.Type)
+	assert.Contains(t, problem.Detail, fmt.Sprint(limit), "the limit is stated in the detail")
 	assert.Zero(t, stack.jobs.Len())
 }
 
@@ -411,8 +433,7 @@ func TestGetJob(t *testing.T) {
 				tt.mutate(t, stack, id)
 			}
 
-			resp, err := http.Get(stack.server.URL + "/jobs/" + id)
-			require.NoError(t, err)
+			resp := stack.get(t, "/jobs/"+id)
 			defer func() { _ = resp.Body.Close() }()
 
 			require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -445,16 +466,15 @@ func TestGetJobNotFound(t *testing.T) {
 
 			stack := newTestStack(t, Config{})
 
-			resp, err := http.Get(stack.server.URL + "/jobs/" + tt.id)
-			require.NoError(t, err)
+			resp := stack.get(t, "/jobs/"+tt.id)
 			defer func() { _ = resp.Body.Close() }()
 
 			require.Equal(t, http.StatusNotFound, resp.StatusCode)
 
-			errResp := decodeError(t, resp.Body)
-			assert.Equal(t, codeJobNotFound, errResp.Error.Code)
-			assert.Contains(t, errResp.Error.Message, tt.id)
-			assert.NotEmpty(t, errResp.Error.RequestID)
+			problem := decodeProblem(t, resp)
+			assert.Equal(t, TypeJobNotFound, problem.Type)
+			assert.Contains(t, problem.Detail, tt.id)
+			assert.NotEmpty(t, problem.RequestID)
 		})
 	}
 }
@@ -472,8 +492,7 @@ func TestUploadThenPollRoundTrip(t *testing.T) {
 	require.NoError(t, stack.jobs.UpdateStatus(
 		context.Background(), id, domain.StatusDone, "results/"+id+".webp", nil))
 
-	resp, err := http.Get(stack.server.URL + "/jobs/" + id)
-	require.NoError(t, err)
+	resp := stack.get(t, "/jobs/"+id)
 	defer func() { _ = resp.Body.Close() }()
 
 	job := decodeJob(t, resp.Body)
@@ -512,14 +531,13 @@ func TestHealthAndReadiness(t *testing.T) {
 
 			stack := newTestStack(t, Config{ReadyCheck: tt.readyCheck})
 
-			resp, err := http.Get(stack.server.URL + tt.path)
-			require.NoError(t, err)
+			resp := stack.get(t, tt.path)
 			defer func() { _ = resp.Body.Close() }()
 
 			require.Equal(t, tt.wantStatus, resp.StatusCode)
 
 			if tt.wantBody == "" {
-				assert.Equal(t, codeNotReady, decodeError(t, resp.Body).Error.Code)
+				assert.Equal(t, TypeNotReady, decodeProblem(t, resp).Type)
 				return
 			}
 
@@ -538,19 +556,19 @@ func TestRoutingErrors(t *testing.T) {
 		method     string
 		path       string
 		wantStatus int
-		wantCode   string
+		wantType   string
 	}{
 		{
 			name: "unknown path", method: http.MethodGet, path: "/nope",
-			wantStatus: http.StatusNotFound, wantCode: codeNotFound,
+			wantStatus: http.StatusNotFound, wantType: TypeNotFound,
 		},
 		{
 			name: "wrong method on uploads", method: http.MethodGet, path: "/uploads",
-			wantStatus: http.StatusMethodNotAllowed, wantCode: codeMethodNotAllowed,
+			wantStatus: http.StatusMethodNotAllowed, wantType: TypeMethodNotAllowed,
 		},
 		{
 			name: "wrong method on a job", method: http.MethodDelete, path: "/jobs/abc",
-			wantStatus: http.StatusMethodNotAllowed, wantCode: codeMethodNotAllowed,
+			wantStatus: http.StatusMethodNotAllowed, wantType: TypeMethodNotAllowed,
 		},
 	}
 
@@ -568,7 +586,7 @@ func TestRoutingErrors(t *testing.T) {
 			defer func() { _ = resp.Body.Close() }()
 
 			require.Equal(t, tt.wantStatus, resp.StatusCode)
-			assert.Equal(t, tt.wantCode, decodeError(t, resp.Body).Error.Code)
+			assert.Equal(t, tt.wantType, decodeProblem(t, resp).Type)
 		})
 	}
 }
@@ -630,7 +648,7 @@ func TestMiddleware(t *testing.T) {
 		var logged bytes.Buffer
 		logger := slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-		router := New(nil, nil, Config{Logger: logger}).Routes()
+		router := New(nil, nil, mustIssuer(t), Config{Logger: logger}).Routes()
 		mux, ok := router.(interface {
 			Get(pattern string, h http.HandlerFunc)
 			ServeHTTP(http.ResponseWriter, *http.Request)
@@ -648,7 +666,7 @@ func TestMiddleware(t *testing.T) {
 		defer func() { _ = resp.Body.Close() }()
 
 		require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
-		assert.Equal(t, codeInternal, decodeError(t, resp.Body).Error.Code)
+		assert.Equal(t, TypeInternal, decodeProblem(t, resp).Type)
 		assert.Contains(t, logged.String(), "panic recovered")
 		assert.Contains(t, logged.String(), "deliberate test panic")
 	})
@@ -657,13 +675,13 @@ func TestMiddleware(t *testing.T) {
 func TestNewAppliesDefaults(t *testing.T) {
 	t.Parallel()
 
-	api := New(nil, nil, Config{})
+	api := New(nil, nil, mustIssuer(t), Config{})
 
 	assert.NotNil(t, api.cfg.Logger)
 	assert.Equal(t, DefaultMaxUploadBytes, api.cfg.MaxUploadBytes)
 	assert.Equal(t, []string{"*"}, api.cfg.AllowedOrigins)
 
-	trimmed := New(nil, nil, Config{PublicBaseURL: "https://cdn.example.com/"})
+	trimmed := New(nil, nil, mustIssuer(t), Config{PublicBaseURL: "https://cdn.example.com/"})
 	assert.Equal(t, "https://cdn.example.com", trimmed.cfg.PublicBaseURL,
 		"a trailing slash is trimmed so result urls have exactly one")
 }
@@ -672,10 +690,9 @@ func TestNewAppliesDefaults(t *testing.T) {
 func createJob(t *testing.T, stack *testStack, spec string) string {
 	t.Helper()
 
-	body, contentType := multipartBody(t, FileField, "photo.png", "image-bytes", SpecField, spec)
+	body, contentType := multipartBody(t, FileField, "photo.png", string(pngBytes(t)), SpecField, spec)
 
-	resp, err := http.Post(stack.server.URL+"/uploads", contentType, body)
-	require.NoError(t, err)
+	resp := stack.post(t, "/uploads", contentType, body)
 	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusAccepted, resp.StatusCode)
 
@@ -695,4 +712,13 @@ func TestUploadTimestampsAreUTC(t *testing.T) {
 
 	assert.Equal(t, time.UTC, stored.CreatedAt.Location())
 	assert.Equal(t, time.UTC, stored.UpdatedAt.Location())
+}
+
+// mustIssuer returns a token issuer for tests that only exercise wiring.
+func mustIssuer(t *testing.T) *TokenIssuer {
+	t.Helper()
+
+	issuer, err := NewIssuer(testKey)
+	require.NoError(t, err)
+	return issuer
 }

@@ -1,6 +1,6 @@
 module imageforge
 
-go 1.24
+go 1.24.0
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.45.1
@@ -15,9 +15,11 @@ require (
 	github.com/davidbyttow/govips/v2 v2.17.0
 	github.com/go-chi/chi/v5 v5.3.2
 	github.com/go-chi/cors v1.2.2
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/prometheus/client_golang v1.23.0
 	github.com/stretchr/testify v1.12.1
 	golang.org/x/image v0.25.0
+	golang.org/x/time v0.13.0
 )
 
 require (

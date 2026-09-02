@@ -88,6 +88,78 @@ func (a *API) newJobResponse(job *domain.Job) jobResponse {
 	return resp
 }
 
+// tokenRequest is the body of POST /auth/token.
+type tokenRequest struct {
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret"`
+}
+
+// tokenResponse is an issued token, shaped like an OAuth 2 token response so
+// existing clients need no special handling.
+type tokenResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	ExpiresIn   int    `json:"expires_in"`
+}
+
+// handleToken issues a bearer token for a client.
+//
+// This is a demonstration credential flow, not an identity system: with no
+// configured client secret it hands a token to whoever asks. What it does do
+// properly is sign that token, pin the algorithm, and give it an expiry, so the
+// middleware that consumes it is the real thing.
+func (a *API) handleToken(w http.ResponseWriter, r *http.Request) {
+	// The body is tiny; refuse to read a large one rather than buffer it.
+	body := http.MaxBytesReader(w, r.Body, maxSpecBytes)
+
+	var request tokenRequest
+	decoder := json.NewDecoder(body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		writeProblem(w, r, http.StatusBadRequest, TypeInvalidSpec, "Bad Request",
+			`The body must be JSON with a "client_id", and a "client_secret" when the server requires one.`)
+		return
+	}
+
+	clientID := strings.TrimSpace(request.ClientID)
+	if clientID == "" {
+		writeProblem(w, r, http.StatusBadRequest, TypeInvalidSpec, "Bad Request",
+			`"client_id" is required.`)
+		return
+	}
+	if len(clientID) > 128 {
+		writeProblem(w, r, http.StatusBadRequest, TypeInvalidSpec, "Bad Request",
+			`"client_id" must be 128 characters or fewer.`)
+		return
+	}
+
+	if !a.issuer.Authorize(clientID, request.ClientSecret) {
+		a.cfg.Logger.WarnContext(r.Context(), "rejected a token request",
+			slogClient(clientID))
+		writeProblem(w, r, http.StatusUnauthorized, TypeInvalidCredential, "Unauthorized",
+			"The client id or secret is not recognized.")
+		return
+	}
+
+	token, err := a.issuer.Issue(clientID)
+	if err != nil {
+		a.cfg.Logger.ErrorContext(r.Context(), "issuing a token failed", slogError(err))
+		writeProblem(w, r, http.StatusInternalServerError, TypeInternal,
+			"Internal Server Error", "The token could not be issued.")
+		return
+	}
+
+	a.cfg.Logger.InfoContext(r.Context(), "issued a token", slogClient(clientID))
+
+	// A credential must never be cached by a proxy or the browser.
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, r, http.StatusOK, tokenResponse{
+		AccessToken: token,
+		TokenType:   "Bearer",
+		ExpiresIn:   int(a.issuer.TTL().Seconds()),
+	})
+}
+
 // handleUpload accepts a multipart upload and queues a transformation job.
 //
 // The request carries the image in the "file" part and the transformation in a
@@ -102,9 +174,13 @@ func (a *API) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	job, err := a.createJob.Execute(r.Context(), usecase.CreateJobInput{Source: file, Spec: spec})
 	if err != nil {
-		a.writeUseCaseError(w, r, err)
+		a.writeUseCaseProblem(w, r, err)
 		return
 	}
+
+	clientID, _ := ClientID(r.Context())
+	a.cfg.Logger.InfoContext(r.Context(), "accepted a job",
+		slogClient(clientID), slog.String("job_id", job.ID))
 
 	w.Header().Set("Location", "/jobs/"+job.ID)
 	writeJSON(w, r, http.StatusAccepted, a.newJobResponse(job))
@@ -126,28 +202,77 @@ func (a *API) readUpload(w http.ResponseWriter, r *http.Request) (domain.Transfo
 	if err := r.ParseMultipartForm(multipartMemoryBytes); err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			writeError(w, r, http.StatusRequestEntityTooLarge, codePayloadTooLarge,
-				fmt.Sprintf("the request body exceeds the %d byte limit", a.cfg.MaxUploadBytes))
+			writeProblem(w, r, http.StatusRequestEntityTooLarge, TypePayloadTooLarge,
+				"Payload Too Large",
+				fmt.Sprintf("The request body exceeds the %d byte limit.", a.cfg.MaxUploadBytes))
 			return zero, nil, false
 		}
-		writeError(w, r, http.StatusBadRequest, codeInvalidMultipart,
-			"the request body is not a valid multipart form")
+		writeProblem(w, r, http.StatusBadRequest, TypeInvalidMultipart, "Bad Request",
+			"The request body is not a valid multipart form.")
 		return zero, nil, false
 	}
 
-	file, _, err := r.FormFile(FileField)
+	file, header, err := r.FormFile(FileField)
 	if err != nil {
-		writeError(w, r, http.StatusBadRequest, codeMissingFile,
-			fmt.Sprintf("the %q part is required and must carry the image", FileField))
+		writeProblem(w, r, http.StatusBadRequest, TypeMissingFile, "Bad Request",
+			fmt.Sprintf("The %q part is required and must carry the image.", FileField))
+		return zero, nil, false
+	}
+
+	sniffed, ok := a.checkMediaType(w, r, file, header.Filename)
+	if !ok {
+		_ = file.Close()
 		return zero, nil, false
 	}
 
 	spec, ok := a.readSpec(w, r)
 	if !ok {
-		_ = file.Close()
+		_ = sniffed.Close()
 		return zero, nil, false
 	}
-	return spec, file, true
+	return spec, sniffed, true
+}
+
+// checkMediaType rejects an upload whose bytes are not an image this service
+// accepts, returning a reader that still yields the whole file.
+//
+// What the part declares as its Content-Type is chosen by the client and is
+// worth nothing here; only the bytes are.
+func (a *API) checkMediaType(
+	w http.ResponseWriter,
+	r *http.Request,
+	file io.ReadCloser,
+	filename string,
+) (io.ReadCloser, bool) {
+	mediaType, rewound, err := sniffMediaType(file)
+	if err != nil {
+		if errors.Is(err, ErrUnsupportedMediaType) {
+			writeProblem(w, r, http.StatusUnsupportedMediaType, TypeUnsupportedMedia,
+				"Unsupported Media Type", "The uploaded file is empty.")
+			return nil, false
+		}
+		a.cfg.Logger.ErrorContext(r.Context(), "reading the upload failed", slogError(err))
+		writeProblem(w, r, http.StatusBadRequest, TypeInvalidMultipart, "Bad Request",
+			"The uploaded file could not be read.")
+		return nil, false
+	}
+
+	if !allowedMediaType(mediaType) {
+		clientID, _ := ClientID(r.Context())
+		a.cfg.Logger.WarnContext(r.Context(), "rejected an upload on its media type",
+			slogClient(clientID),
+			slog.String("detected", mediaType),
+			slog.String("declared", r.Header.Get("Content-Type")))
+
+		_ = rewound.Close()
+		writeProblem(w, r, http.StatusUnsupportedMediaType, TypeUnsupportedMedia,
+			"Unsupported Media Type",
+			fmt.Sprintf("%q is %s, which is not an accepted image type. Accepted types are %s.",
+				filename, mediaType, strings.Join(AllowedMediaTypes, ", ")))
+		return nil, false
+	}
+
+	return rewound, true
 }
 
 // readSpec decodes the "spec" part, responding itself on any failure.
@@ -156,13 +281,13 @@ func (a *API) readSpec(w http.ResponseWriter, r *http.Request) (domain.Transform
 
 	raw := r.FormValue(SpecField)
 	if raw == "" {
-		writeError(w, r, http.StatusBadRequest, codeInvalidSpec,
-			fmt.Sprintf("the %q part is required and must carry a JSON transformation", SpecField))
+		writeProblem(w, r, http.StatusBadRequest, TypeInvalidSpec, "Bad Request",
+			fmt.Sprintf("The %q part is required and must carry a JSON transformation.", SpecField))
 		return zero, false
 	}
 	if len(raw) > maxSpecBytes {
-		writeError(w, r, http.StatusBadRequest, codeInvalidSpec,
-			fmt.Sprintf("the %q part exceeds %d bytes", SpecField, maxSpecBytes))
+		writeProblem(w, r, http.StatusBadRequest, TypeInvalidSpec, "Bad Request",
+			fmt.Sprintf("The %q part exceeds %d bytes.", SpecField, maxSpecBytes))
 		return zero, false
 	}
 
@@ -171,32 +296,34 @@ func (a *API) readSpec(w http.ResponseWriter, r *http.Request) (domain.Transform
 
 	var dto transformationSpec
 	if err := decoder.Decode(&dto); err != nil {
-		writeError(w, r, http.StatusBadRequest, codeInvalidSpec,
-			fmt.Sprintf("the %q part is not a valid transformation: %v", SpecField, err))
+		writeProblem(w, r, http.StatusBadRequest, TypeInvalidSpec, "Bad Request",
+			fmt.Sprintf("The %q part is not a valid transformation: %v", SpecField, err))
 		return zero, false
 	}
 
 	return dto.toDomain(), true
 }
 
-// writeUseCaseError maps a CreateJob failure onto a status code. Anything that
-// is not the caller's fault is reported as a 500 without leaking internals.
-func (a *API) writeUseCaseError(w http.ResponseWriter, r *http.Request, err error) {
+// writeUseCaseProblem maps a CreateJob failure onto a status code. Anything
+// that is not the caller's fault is reported as a 500 without leaking
+// internals.
+func (a *API) writeUseCaseProblem(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, domain.ErrInvalidDimensions),
 		errors.Is(err, domain.ErrInvalidFormat),
 		errors.Is(err, domain.ErrInvalidQuality):
-		writeError(w, r, http.StatusBadRequest, codeInvalidTransformation, err.Error())
+		writeProblem(w, r, http.StatusBadRequest, TypeInvalidTransform,
+			"Bad Request", err.Error())
 	case errors.Is(err, usecase.ErrNoSource):
-		writeError(w, r, http.StatusBadRequest, codeMissingFile, err.Error())
-	case errors.Is(err, r.Context().Err()) && r.Context().Err() != nil:
+		writeProblem(w, r, http.StatusBadRequest, TypeMissingFile, "Bad Request", err.Error())
+	case r.Context().Err() != nil:
 		// The client hung up; nothing useful can be written back.
-		writeError(w, r, http.StatusRequestTimeout, codeInternal, "the request was canceled")
+		writeProblem(w, r, http.StatusRequestTimeout, TypeInternal,
+			"Request Timeout", "The request was canceled.")
 	default:
-		a.cfg.Logger.ErrorContext(r.Context(), "creating the job failed",
-			slog.String("error", err.Error()))
-		writeError(w, r, http.StatusInternalServerError, codeInternal,
-			"the job could not be created")
+		a.cfg.Logger.ErrorContext(r.Context(), "creating the job failed", slogError(err))
+		writeProblem(w, r, http.StatusInternalServerError, TypeInternal,
+			"Internal Server Error", "The job could not be created.")
 	}
 }
 
@@ -204,21 +331,22 @@ func (a *API) writeUseCaseError(w http.ResponseWriter, r *http.Request, err erro
 func (a *API) handleGetJob(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if id == "" {
-		writeError(w, r, http.StatusBadRequest, codeJobNotFound, "a job id is required")
+		writeProblem(w, r, http.StatusBadRequest, TypeJobNotFound, "Bad Request",
+			"A job id is required.")
 		return
 	}
 
 	job, err := a.jobs.Get(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, ports.ErrJobNotFound) {
-			writeError(w, r, http.StatusNotFound, codeJobNotFound,
-				fmt.Sprintf("no job with id %q", id))
+			writeProblem(w, r, http.StatusNotFound, TypeJobNotFound, "Not Found",
+				fmt.Sprintf("No job with id %q.", id))
 			return
 		}
 		a.cfg.Logger.ErrorContext(r.Context(), "loading the job failed",
-			slog.String("job_id", id),
-			slog.String("error", err.Error()))
-		writeError(w, r, http.StatusInternalServerError, codeInternal, "the job could not be loaded")
+			slog.String("job_id", id), slogError(err))
+		writeProblem(w, r, http.StatusInternalServerError, TypeInternal,
+			"Internal Server Error", "The job could not be loaded.")
 		return
 	}
 
@@ -236,9 +364,9 @@ func (a *API) handleHealthz(w http.ResponseWriter, r *http.Request) {
 func (a *API) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	if a.cfg.ReadyCheck != nil {
 		if err := a.cfg.ReadyCheck(r.Context()); err != nil {
-			a.cfg.Logger.WarnContext(r.Context(), "readiness check failed",
-				slog.String("error", err.Error()))
-			writeError(w, r, http.StatusServiceUnavailable, codeNotReady, "the service is not ready")
+			a.cfg.Logger.WarnContext(r.Context(), "readiness check failed", slogError(err))
+			writeProblem(w, r, http.StatusServiceUnavailable, TypeNotReady,
+				"Service Unavailable", "The service is not ready.")
 			return
 		}
 	}

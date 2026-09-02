@@ -2,7 +2,8 @@
 // use cases in internal/usecase through a chi router.
 //
 // The package owns request decoding, response encoding and the middleware
-// stack; it holds no business rules of its own.
+// stack; it holds no business rules of its own. Errors are RFC 7807 problem
+// details, served as application/problem+json.
 package httpapi
 
 import (
@@ -55,17 +56,31 @@ type Config struct {
 	// ReadyCheck reports whether the service can serve traffic. A nil check
 	// means always ready.
 	ReadyCheck func(context.Context) error
+	// RateLimit is the sustained requests per second allowed per client.
+	// Defaults to DefaultRateLimit; a negative value disables limiting.
+	RateLimit float64
+	// RateBurst is how many requests a client may make back to back. Defaults
+	// to DefaultRateBurst; a negative value disables limiting.
+	RateBurst int
+	// clock overrides time for tests, in both the issuer and the limiter.
+	clock func() time.Time
 }
 
 // API serves the ImageForge HTTP endpoints.
 type API struct {
 	createJob *usecase.CreateJob
 	jobs      ports.JobRepository
+	issuer    *TokenIssuer
+	limiter   *rateLimiter
 	cfg       Config
 }
 
 // New wires the API to its dependencies.
-func New(createJob *usecase.CreateJob, jobs ports.JobRepository, cfg Config) *API {
+//
+// The issuer both mints the tokens /auth/token hands out and verifies the ones
+// presented to the protected routes, so a caller cannot configure one without
+// the other.
+func New(createJob *usecase.CreateJob, jobs ports.JobRepository, issuer *TokenIssuer, cfg Config) *API {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -75,10 +90,25 @@ func New(createJob *usecase.CreateJob, jobs ports.JobRepository, cfg Config) *AP
 	if len(cfg.AllowedOrigins) == 0 {
 		cfg.AllowedOrigins = []string{"*"}
 	}
+	if cfg.RateLimit == 0 {
+		cfg.RateLimit = DefaultRateLimit
+	}
+	if cfg.RateBurst == 0 {
+		cfg.RateBurst = DefaultRateBurst
+	}
 	cfg.PublicBaseURL = strings.TrimSuffix(cfg.PublicBaseURL, "/")
 
-	return &API{createJob: createJob, jobs: jobs, cfg: cfg}
+	return &API{
+		createJob: createJob,
+		jobs:      jobs,
+		issuer:    issuer,
+		limiter:   newRateLimiter(cfg.RateLimit, cfg.RateBurst, cfg.clock),
+		cfg:       cfg,
+	}
 }
+
+// Close releases what the API holds. It is safe to call more than once.
+func (a *API) Close() { a.limiter.Close() }
 
 // Routes returns the fully assembled handler, middleware included.
 //
@@ -95,23 +125,43 @@ func (a *API) Routes() http.Handler {
 		AllowedOrigins:   a.cfg.AllowedOrigins,
 		AllowedMethods:   []string{http.MethodGet, http.MethodPost, http.MethodOptions},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", middleware.RequestIDHeader},
-		ExposedHeaders:   []string{"Location", middleware.RequestIDHeader},
+		ExposedHeaders:   []string{"Location", "Retry-After", middleware.RequestIDHeader},
 		AllowCredentials: false,
 		MaxAge:           int((5 * time.Minute).Seconds()),
 	}))
 	router.Use(middleware.RequestSize(a.cfg.MaxUploadBytes))
 
+	// Probes stay open: a load balancer cannot hold a token, and a liveness
+	// check that fails on authentication is worse than useless.
 	router.Get("/healthz", a.handleHealthz)
 	router.Get("/readyz", a.handleReadyz)
-	router.Post("/uploads", a.handleUpload)
-	router.Get("/jobs/{id}", a.handleGetJob)
+
+	// Issuing a token cannot itself require one.
+	router.Post("/auth/token", a.handleToken)
+
+	// Everything that touches a job is authenticated, and rate limited by the
+	// authenticated client rather than by anything the caller can change.
+	router.Group(func(protected chi.Router) {
+		protected.Use(a.requireAuth)
+		protected.Use(a.rateLimit)
+
+		protected.Post("/uploads", a.handleUpload)
+		protected.Get("/jobs/{id}", a.handleGetJob)
+	})
 
 	router.NotFound(func(w http.ResponseWriter, r *http.Request) {
-		writeError(w, r, http.StatusNotFound, codeNotFound, "no route matches this path")
+		writeProblem(w, r, http.StatusNotFound, TypeNotFound,
+			"Not Found", "No route matches this path.")
 	})
 	router.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
-		writeError(w, r, http.StatusMethodNotAllowed, codeMethodNotAllowed, "this method is not allowed on this path")
+		writeProblem(w, r, http.StatusMethodNotAllowed, TypeMethodNotAllowed,
+			"Method Not Allowed", "This method is not allowed on this path.")
 	})
 
 	return router
+}
+
+// slogClient is a client id as a log attribute.
+func slogClient(clientID string) slog.Attr {
+	return slog.String("client_id", clientID)
 }
