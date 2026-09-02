@@ -22,6 +22,7 @@ import (
 	"imageforge/internal/adapters"
 	"imageforge/internal/adapters/httpapi"
 	"imageforge/internal/adapters/memqueue"
+	"imageforge/internal/healthcheck"
 	"imageforge/internal/usecase"
 )
 
@@ -35,6 +36,12 @@ const (
 )
 
 func main() {
+	// The container image is distroless and has no curl to probe with, so the
+	// binary probes itself: "api healthcheck" exits 0 when /healthz answers.
+	if healthcheck.Requested(os.Args[1:]) {
+		healthcheck.Main(envString("IMAGEFORGE_ADDR", ":8080"))
+	}
+
 	if err := run(); err != nil {
 		slog.Error("api exited with an error", slog.String("error", err.Error()))
 		os.Exit(1)

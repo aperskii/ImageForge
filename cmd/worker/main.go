@@ -29,6 +29,7 @@ import (
 	"imageforge/internal/adapters/imageproc"
 	"imageforge/internal/adapters/memqueue"
 	"imageforge/internal/domain"
+	"imageforge/internal/healthcheck"
 	"imageforge/internal/metrics"
 	"imageforge/internal/ports"
 	"imageforge/internal/usecase"
@@ -36,6 +37,12 @@ import (
 )
 
 func main() {
+	// The worker serves /healthz on its metrics listener; "worker healthcheck"
+	// probes it, so the image needs no curl of its own.
+	if healthcheck.Requested(os.Args[1:]) {
+		healthcheck.Main(envString("IMAGEFORGE_METRICS_ADDR", ":9090"))
+	}
+
 	if err := run(os.Args[1:]); err != nil {
 		slog.Error("worker exited with an error", slog.String("error", err.Error()))
 		os.Exit(1)
