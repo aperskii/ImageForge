@@ -16,7 +16,10 @@ import (
 )
 
 // Compile-time assertion that Queue satisfies the port.
-var _ ports.Queue = (*Queue)(nil)
+var (
+	_ ports.Queue         = (*Queue)(nil)
+	_ ports.DepthReporter = (*Queue)(nil)
+)
 
 // ErrClosed is returned when enqueueing onto a closed queue.
 var ErrClosed = errors.New("queue is closed")
@@ -112,3 +115,9 @@ func (q *Queue) Close() {
 	q.closed = true
 	close(q.ch)
 }
+
+// Depth reports how many identifiers are waiting.
+//
+// Unlike a distributed broker's approximation this figure is exact, because the
+// whole queue is one buffered channel in this process.
+func (q *Queue) Depth(_ context.Context) (int, error) { return len(q.ch), nil }

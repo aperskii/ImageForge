@@ -46,6 +46,17 @@ type Acknowledger interface {
 	Nack(ctx context.Context, jobID string) error
 }
 
+// DepthReporter is an optional companion to Queue, implemented by queues that
+// can say how much work is waiting.
+//
+// The figure is advisory: on a distributed broker it is an approximation that
+// is already stale by the time it is read. It is meant for a metric or a
+// dashboard, never for a decision about a specific job.
+type DepthReporter interface {
+	// Depth reports roughly how many jobs are waiting to be consumed.
+	Depth(ctx context.Context) (int, error)
+}
+
 // JobRepository persists job state.
 type JobRepository interface {
 	// Save stores job, creating it or replacing it wholesale.

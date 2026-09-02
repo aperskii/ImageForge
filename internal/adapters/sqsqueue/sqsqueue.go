@@ -11,22 +11,39 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 
 	"imageforge/internal/ports"
 )
 
-// Compile-time assertions that Queue satisfies both the port and its optional
-// companion.
+// Compile-time assertions that Queue satisfies the port and its optional
+// companions.
 var (
-	_ ports.Queue        = (*Queue)(nil)
-	_ ports.Acknowledger = (*Queue)(nil)
+	_ ports.Queue         = (*Queue)(nil)
+	_ ports.Acknowledger  = (*Queue)(nil)
+	_ ports.DepthReporter = (*Queue)(nil)
 )
+
+// API is the slice of the SQS client this adapter uses.
+//
+// Depending on an interface rather than *sqs.Client is what lets the receive
+// loop, its backoff and its recovery be tested without a broker; *sqs.Client
+// satisfies it as it stands.
+type API interface {
+	GetQueueUrl(context.Context, *sqs.GetQueueUrlInput, ...func(*sqs.Options)) (*sqs.GetQueueUrlOutput, error)
+	GetQueueAttributes(context.Context, *sqs.GetQueueAttributesInput, ...func(*sqs.Options)) (*sqs.GetQueueAttributesOutput, error)
+	SendMessage(context.Context, *sqs.SendMessageInput, ...func(*sqs.Options)) (*sqs.SendMessageOutput, error)
+	ReceiveMessage(context.Context, *sqs.ReceiveMessageInput, ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error)
+	DeleteMessage(context.Context, *sqs.DeleteMessageInput, ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error)
+	ChangeMessageVisibility(context.Context, *sqs.ChangeMessageVisibilityInput, ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error)
+}
 
 // Defaults applied when no option overrides them.
 const (
@@ -47,18 +64,26 @@ const (
 //
 // It is safe for concurrent use.
 type Queue struct {
-	client   *sqs.Client
+	client   API
 	queueURL string
 
 	waitTime          time.Duration
 	visibilityTimeout time.Duration
 	maxMessages       int32
+	backoffBase       time.Duration
+	backoffMax        time.Duration
+
+	// onReceiveError is called for every failed receive, with the consecutive
+	// failure count and the delay before the next attempt. It exists so the
+	// caller can log and count retries without this package importing a logger.
 
 	// receipts maps a job identifier to the receipt handle of its delivery, so
 	// Ack and Nack can settle it. Keyed by job id because that is all the
 	// Queue port carries; a duplicate delivery of the same job therefore
 	// replaces the earlier handle, whose message simply reappears when its
 	// visibility timeout expires and is skipped as no longer pending.
+	onReceiveError func(err error, attempt int, delay time.Duration)
+
 	mu       sync.Mutex
 	receipts map[string]string
 }
@@ -98,7 +123,7 @@ func WithMaxMessages(n int32) Option {
 
 // New wires a Queue to an SQS queue, named either by its URL or by its name,
 // which is resolved to a URL once here rather than on every call.
-func New(ctx context.Context, client *sqs.Client, nameOrURL string, opts ...Option) (*Queue, error) {
+func New(ctx context.Context, client API, nameOrURL string, opts ...Option) (*Queue, error) {
 	if client == nil {
 		return nil, errors.New("sqsqueue: nil client")
 	}
@@ -121,6 +146,9 @@ func New(ctx context.Context, client *sqs.Client, nameOrURL string, opts ...Opti
 		waitTime:          DefaultWaitTime,
 		visibilityTimeout: DefaultVisibilityTimeout,
 		maxMessages:       DefaultMaxMessages,
+		backoffBase:       DefaultBackoffBase,
+		backoffMax:        DefaultBackoffMax,
+		onReceiveError:    func(error, int, time.Duration) {},
 		receipts:          make(map[string]string),
 	}
 	for _, opt := range opts {
@@ -157,24 +185,29 @@ func (q *Queue) Consume(ctx context.Context) (<-chan string, error) {
 
 	go func() {
 		defer close(out)
+
+		retry := newBackoff(q.backoffBase, q.backoffMax)
 		for {
 			if ctx.Err() != nil {
 				return
 			}
+
 			messages, err := q.receive(ctx)
 			if err != nil {
 				if ctx.Err() != nil {
 					return
 				}
-				// A transient receive failure must not kill the consumer. Back
-				// off briefly so a persistent one does not spin.
-				select {
-				case <-ctx.Done():
+				// A transient failure must not kill the consumer: the queue
+				// coming back should find a worker still waiting for it. Backing
+				// off stops a persistent one from spinning on the API.
+				delay := retry.next()
+				q.onReceiveError(err, retry.attempts(), delay)
+				if !wait(ctx, delay) {
 					return
-				case <-time.After(time.Second):
 				}
 				continue
 			}
+			retry.reset()
 
 			for _, jobID := range messages {
 				select {
@@ -278,4 +311,56 @@ func (q *Queue) InFlight() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return len(q.receipts)
+}
+
+// WithBackoff sets the bounds of the retry delay after a failed receive.
+// Non-positive values leave the defaults in place.
+func WithBackoff(base, maxDelay time.Duration) Option {
+	return func(q *Queue) {
+		if base > 0 {
+			q.backoffBase = base
+		}
+		if maxDelay > 0 {
+			q.backoffMax = maxDelay
+		}
+	}
+}
+
+// WithReceiveErrorHandler installs a callback invoked for every failed receive,
+// with the consecutive failure count and the delay before the next attempt.
+//
+// It lets the caller log and count retries; this package deliberately holds no
+// logger of its own.
+func WithReceiveErrorHandler(fn func(err error, attempt int, delay time.Duration)) Option {
+	return func(q *Queue) {
+		if fn != nil {
+			q.onReceiveError = fn
+		}
+	}
+}
+
+// Depth reports roughly how many messages are waiting on the queue.
+//
+// SQS only ever returns an approximation, so the figure suits a gauge and not a
+// decision about any particular job.
+func (q *Queue) Depth(ctx context.Context) (int, error) {
+	out, err := q.client.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
+		QueueUrl:       aws.String(q.queueURL),
+		AttributeNames: []types.QueueAttributeName{types.QueueAttributeNameApproximateNumberOfMessages},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("sqsqueue: depth: %w", err)
+	}
+
+	raw, ok := out.Attributes[string(types.QueueAttributeNameApproximateNumberOfMessages)]
+	if !ok {
+		return 0, fmt.Errorf("sqsqueue: depth: %s missing from the response",
+			types.QueueAttributeNameApproximateNumberOfMessages)
+	}
+
+	depth, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("sqsqueue: depth: %q is not a number: %w", raw, err)
+	}
+	return depth, nil
 }
