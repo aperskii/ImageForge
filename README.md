@@ -14,13 +14,32 @@ and the whole stack can be run locally against LocalStack.
 ## Architecture
 
 ```
-+-------------------------------------------------------------+
-|                                                             |
-|   ASCII ARCHITECTURE DIAGRAM PLACEHOLDER                    |
-|                                                             |
-|   (client -> api -> queue -> worker -> storage / metadata)  |
-|                                                             |
-+-------------------------------------------------------------+
+                 upload                              poll
+  browser ──────────────────▶  api  ◀───────────────────────
+     │                          │                          │
+     │                          │ 1. put original          │
+     │                          │ 2. save job              │
+     │                          │ 3. enqueue id            │
+     │                          ▼                          │
+     │              ┌───────────────────────┐              │
+     │              │  Storage   S3 / disk  │◀────┐        │
+     │              │  Queue     SQS / chan │     │        │
+     │              │  JobRepo   Dynamo/map │◀──┐ │        │
+     │              └───────────┬───────────┘   │ │        │
+     │                          │ job id        │ │        │
+     │                          ▼               │ │        │
+     │                       worker ────────────┘ │        │
+     │                          │  status         │        │
+     │                          └─────────────────┘        │
+     │                             read, transform, write  │
+     │                                                     │
+     └─────────────────────────────────────────────────────┘
+                     result fetched from storage
+
+  The middle box is the three ports. Everything above it is transport and
+  everything below is infrastructure; the domain and use cases in between
+  know only the interfaces, which is what lets the same code run on a
+  filesystem and a channel or on S3, SQS and DynamoDB.
 ```
 
 ## Layout
@@ -50,20 +69,69 @@ test/integration         End-to-end tests against LocalStack
 .github/workflows        CI pipelines
 ```
 
-## Getting started
 
-Requirements: Go 1.24+, Node 20+, Docker (with Compose), `golangci-lint`, and
-libvips 8.10+
-(`libvips-dev` on Debian/Ubuntu, `brew install vips` on macOS). To build without
-libvips, see [Image processing backends](#image-processing-backends).
+## Quick start
+
+One command brings up the whole stack — LocalStack, the API, the worker and the
+front-end — with the AWS resources created before anything tries to use them:
 
 ```sh
-make dev          # start the local AWS stack (LocalStack on :4566)
-make run-api      # run the HTTP API
-make run-worker   # run the worker
+make dev
+```
+
+Then open **http://localhost:5173**, drop in an image and press Transform.
+
+| Service    | Where                          | What it is                        |
+| ---------- | ------------------------------ | --------------------------------- |
+| web        | http://localhost:5173          | The React app (Vite, hot reload)   |
+| api        | http://localhost:8080          | The HTTP API                       |
+| worker     | http://localhost:9090/metrics  | Prometheus metrics and health      |
+| localstack | http://localhost:4566          | S3, SQS and DynamoDB               |
+
+The first run builds two images and installs the front-end's dependencies, so
+it takes a few minutes; later runs start in seconds.
+
+```sh
+make dev-logs    # follow every service
+make dev-down    # stop everything and delete its data
+```
+
+Requirements: **Docker with Compose, and nothing else.** Go, Node and libvips
+are only needed to work on the code outside containers — see
+[Getting started](#getting-started) for that.
+
+### What `make dev` actually does
+
+```
+localstack ──healthy──▶ aws-init ──exits 0──▶ api ──healthy──▶ web
+                                          └──▶ worker
+```
+
+`aws-init` creates the bucket, the queue, its dead-letter queue and the table,
+then exits. The API and the worker wait for it to *finish*, not merely for
+LocalStack to answer: a container reporting healthy says nothing about whether
+the resources it holds exist yet. Every step of the script is idempotent, so a
+restart costs nothing.
+
+The front-end runs from a bind mount, so editing anything under `web/` reloads
+in the browser without rebuilding an image. The Go services do not: change them
+and run `make dev` again to rebuild.
+
+## Getting started
+
+Everything above runs in containers. To work on the code outside them you need
+Go 1.24+, Node 20+, `golangci-lint`, and libvips 8.10+ (`libvips-dev` on
+Debian/Ubuntu, `brew install vips` on macOS). To build without libvips, see
+[Image processing backends](#image-processing-backends).
+
+```sh
+make aws-up       # just LocalStack, with its resources created
+make run-api      # run the HTTP API from source
+make run-worker   # run the worker from source
 make build        # compile both binaries into ./bin
 make test         # run the test suite with the race detector
 make lint         # run golangci-lint
+make images       # build the two container images
 ```
 
 
@@ -322,6 +390,38 @@ and skips itself when no stack is reachable.
 make aws-up
 make test-integration
 ```
+
+## Container images
+
+Two images, built by `deployments/docker/*.Dockerfile` from the repository root.
+They differ because the binaries differ.
+
+| Image  | Base                      | cgo | Size   |
+| ------ | ------------------------- | --- | ------ |
+| api    | `distroless/static`       | no  | ~23MB  |
+| worker | `debian:bookworm-slim`    | yes | ~356MB |
+
+`cmd/api` never reaches `internal/adapters/imageproc`, so it needs neither cgo
+nor libvips and ships as a single static binary on a base with no shell and no
+package manager — nothing for an attacker who finds a way to execute to run.
+Keeping that true is worth something, so the API deliberately does not import
+the image code.
+
+The worker cannot be static: govips binds libvips through cgo. Its build stage
+installs `libvips-dev` for the headers and the runtime stage installs
+`libvips42` for the shared library alone, which leaves the compiler, the headers
+and the Go toolchain out of the shipped image.
+
+Both run as an unprivileged user (uid 65532) and both carry a `HEALTHCHECK` that
+invokes the binary itself:
+
+```sh
+docker run --rm imageforge-api:latest healthcheck
+```
+
+That subcommand exists because the API image has no curl and no shell to probe
+with, and adding one to a production image so a healthcheck can run would be a
+poor trade.
 ## Image processing backends
 
 `internal/adapters/imageproc` implements the `ImageProcessor` port twice, with
@@ -345,8 +445,6 @@ make test TEST_FLAGS='-tags nogovips -count=1'
 ```
 ## Status
 
-Work in progress. The domain model, ports, use cases, HTTP API and worker pool
-are in place and tested, on two interchangeable backends: in-process adapters
-that need nothing external, and S3, SQS and DynamoDB, verified end to end
-against LocalStack. The Terraform deployment and the web front-end are not
-implemented yet.
+Work in progress. The pipeline runs end to end -- API, worker, front-end and
+the AWS adapters -- on two interchangeable backends, containerized and driven
+by a single `make dev`. The Terraform deployment is not written yet.

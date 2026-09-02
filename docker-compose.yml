@@ -1,3 +1,22 @@
+# The whole stack: LocalStack standing in for AWS, the API, the worker and the
+# front-end dev server. `make dev` brings it all up.
+#
+# Startup is ordered by condition, not by sleeping: aws-init runs to completion
+# before the API or the worker start, so neither can race the creation of the
+# bucket, the queue and the table.
+
+name: imageforge
+
+x-aws-env: &aws-env
+  AWS_ENDPOINT_URL: http://localstack:4566
+  AWS_REGION: eu-west-1
+  # LocalStack accepts any credentials, but the SDK refuses to sign without.
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  IMAGEFORGE_S3_BUCKET: imageforge-media
+  IMAGEFORGE_SQS_QUEUE: imageforge-jobs
+  IMAGEFORGE_DYNAMODB_TABLE: imageforge-jobs
+
 services:
   localstack:
     image: localstack/localstack:3
@@ -9,21 +28,111 @@ services:
       DEBUG: "0"
       AWS_DEFAULT_REGION: eu-west-1
       AWS_REGION: eu-west-1
+      # LocalStack overrides AWS_REGION inside its own init stage, so the
+      # script reads this one instead and creates everything in one region.
       IMAGEFORGE_AWS_REGION: eu-west-1
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
       PERSISTENCE: "0"
     volumes:
-      # LocalStack runs every script here once the services are up.
-      - ./deployments/docker/localstack-init.sh:/etc/localstack/init/ready.d/localstack-init.sh:ro
       - localstack-data:/var/lib/localstack
       - /var/run/docker.sock:/var/run/docker.sock
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
-      interval: 10s
+      interval: 5s
       timeout: 5s
-      retries: 10
-      start_period: 20s
+      retries: 20
+      start_period: 10s
+
+  # Creates the bucket, the queue, its dead-letter queue and the table, then
+  # exits. LocalStack also runs this script itself on startup; running it as a
+  # service too is what gives the API and the worker something to depend on,
+  # since "the container is healthy" says nothing about whether the resources
+  # exist yet. Every step is idempotent, so doing it twice costs nothing.
+  aws-init:
+    # Pinned rather than :latest so a rebuild months from now behaves the same.
+    # There is no floating :2 tag on this image.
+    image: amazon/aws-cli:2.36.38
+    container_name: imageforge-aws-init
+    depends_on:
+      localstack:
+        condition: service_healthy
+    environment:
+      <<: *aws-env
+      IMAGEFORGE_AWS_REGION: eu-west-1
+    entrypoint: ["/bin/sh"]
+    command: ["/scripts/localstack-init.sh"]
+    volumes:
+      - ./deployments/docker/localstack-init.sh:/scripts/localstack-init.sh:ro
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: deployments/docker/api.Dockerfile
+    container_name: imageforge-api
+    depends_on:
+      aws-init:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+    environment:
+      <<: *aws-env
+      IMAGEFORGE_BACKEND: aws
+      IMAGEFORGE_ADDR: ":8080"
+      # Results are served straight from LocalStack's S3, which the browser
+      # reaches on the host port rather than by the compose service name.
+      IMAGEFORGE_PUBLIC_BASE_URL: http://localhost:4566/imageforge-media
+      IMAGEFORGE_CORS_ORIGINS: http://localhost:5173
+      IMAGEFORGE_LOG_LEVEL: INFO
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: deployments/docker/worker.Dockerfile
+    container_name: imageforge-worker
+    depends_on:
+      aws-init:
+        condition: service_completed_successfully
+    ports:
+      # Prometheus metrics and the worker's own health endpoint.
+      - "9090:9090"
+    environment:
+      <<: *aws-env
+      IMAGEFORGE_BACKEND: aws
+      IMAGEFORGE_METRICS_ADDR: ":9090"
+      IMAGEFORGE_WORKERS: "4"
+      IMAGEFORGE_LOG_LEVEL: INFO
+    restart: unless-stopped
+
+  # The Vite dev server, with hot reloading against the working tree. This is a
+  # development convenience and not how the front-end would be shipped: a
+  # release build is static files behind a CDN or an nginx image.
+  web:
+    image: node:24-bookworm-slim
+    container_name: imageforge-web
+    depends_on:
+      api:
+        condition: service_healthy
+    working_dir: /app
+    ports:
+      - "5173:5173"
+    environment:
+      # Vite proxies /uploads, /jobs and /auth here, so the browser only ever
+      # makes same-origin requests.
+      IMAGEFORGE_API_URL: http://api:8080
+    volumes:
+      - ./web:/app
+      # An anonymous volume keeps the container's node_modules separate from
+      # the host's, which matters because native packages are built per
+      # platform and the host may not even be Linux.
+      - /app/node_modules
+    command:
+      - sh
+      - -c
+      - "npm install --no-audit --no-fund && npm run dev -- --host 0.0.0.0"
+    restart: unless-stopped
 
 volumes:
   localstack-data:

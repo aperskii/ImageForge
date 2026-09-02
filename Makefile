@@ -10,7 +10,7 @@ BIN_DIR        ?= bin
 
 .DEFAULT_GOAL := build
 
-.PHONY: build test lint run-api run-worker dev aws-init aws-up test-integration
+.PHONY: build test lint run-api run-worker dev dev-down dev-logs images aws-init aws-up test-integration
 
 ## build: compile the api and worker binaries into $(BIN_DIR)
 build:
@@ -32,9 +32,22 @@ run-api:
 run-worker:
 	$(GO) run ./cmd/worker
 
-## dev: start the local development stack (LocalStack)
+## dev: bring up the whole stack (LocalStack, api, worker, web)
 dev:
-	$(DOCKER_COMPOSE) up
+	$(DOCKER_COMPOSE) up --build
+
+## dev-down: stop the stack and delete its data
+dev-down:
+	$(DOCKER_COMPOSE) down --volumes --remove-orphans
+
+## dev-logs: follow the logs of every service
+dev-logs:
+	$(DOCKER_COMPOSE) logs --follow
+
+## images: build the api and worker container images
+images:
+	docker build -f deployments/docker/api.Dockerfile -t imageforge-api:latest .
+	docker build -f deployments/docker/worker.Dockerfile -t imageforge-worker:latest .
 
 ## aws-init: create the LocalStack resources (bucket, queue, DLQ, table)
 aws-init:
