@@ -1,13 +1,14 @@
 // Command worker runs the ImageForge image transformation pool.
 //
-// It wires the pool to the in-process adapters — a filesystem store, an
-// in-memory queue and an in-memory job repository — so the whole pipeline can
-// be exercised locally with no broker, database or cloud account.
+// IMAGEFORGE_BACKEND selects where the work comes from. The default, "memory",
+// uses a filesystem store with an in-memory queue and repository, so the whole
+// pipeline runs with no broker, database or cloud account. "aws" uses S3, SQS
+// and DynamoDB, pointed at LocalStack when AWS_ENDPOINT_URL is set.
 //
-// Those adapters live inside this process, so a worker started on its own has
-// nothing to read: it idles until it is shut down. To watch the pipeline end to
-// end, pass image paths, which are submitted through the same CreateJob use
-// case the API uses and then picked up by the pool:
+// On the memory backend the queue lives inside this process, so a worker
+// started on its own has nothing to read and idles. Pass image paths to submit
+// them through the same CreateJob use case the API uses and watch the pipeline
+// run end to end:
 //
 //	go run ./cmd/worker photo.png diagram.png
 package main
@@ -24,10 +25,9 @@ import (
 	"syscall"
 	"time"
 
+	"imageforge/internal/adapters"
 	"imageforge/internal/adapters/imageproc"
-	"imageforge/internal/adapters/localstorage"
 	"imageforge/internal/adapters/memqueue"
-	"imageforge/internal/adapters/memrepo"
 	"imageforge/internal/domain"
 	"imageforge/internal/usecase"
 	"imageforge/internal/worker"
@@ -48,13 +48,19 @@ func run(args []string) error {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.logLevel}))
 	slog.SetDefault(logger)
 
-	storage, err := localstorage.New(cfg.storageDir)
+	// Signals are trapped before anything is opened, so a Ctrl-C during
+	// startup is still handled by the graceful path.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	set, err := adapters.Open(ctx, cfg.backend, adapters.Config{
+		StorageDir:  cfg.storageDir,
+		QueueBuffer: cfg.queueBuffer,
+	})
 	if err != nil {
-		return fmt.Errorf("storage: %w", err)
+		return err
 	}
-	queue := memqueue.New(cfg.queueBuffer)
-	defer queue.Close()
-	jobs := memrepo.New()
+	defer set.Close()
 
 	processor, err := imageproc.New(imageproc.WithWatermarkText(cfg.watermarkText))
 	if err != nil {
@@ -63,34 +69,33 @@ func run(args []string) error {
 	defer imageproc.Shutdown()
 
 	pool := worker.New(
-		queue,
-		usecase.NewProcessJob(storage, jobs, processor),
+		set.Queue,
+		usecase.NewProcessJob(set.Storage, set.Jobs, processor),
 		worker.WithSize(cfg.poolSize),
 		worker.WithLogger(logger),
 		worker.WithShutdownTimeout(cfg.shutdownTimeout),
 		worker.WithJobTimeout(cfg.jobTimeout),
 	)
 
-	// Signals are trapped before any work starts, so an immediate Ctrl-C is
-	// still handled by the graceful path.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
 	logger.Info("worker starting",
-		slog.String("backend", imageproc.Backend),
-		slog.String("storage_dir", storage.Root()),
+		slog.String("backend", set.Name),
+		slog.String("image_backend", imageproc.Backend),
+		slog.String("adapters", set.Description),
 		slog.Int("workers", cfg.poolSize))
 
 	// Seeding happens before the pool starts so the jobs are already queued;
 	// the buffered queue holds them until a worker picks each one up.
 	if len(args) > 0 {
-		if seedErr := seed(ctx, logger, usecase.NewCreateJob(storage, jobs, queue), cfg.seedSpec, args); seedErr != nil {
+		if seedErr := seed(ctx, logger, usecase.NewCreateJob(set.Storage, set.Jobs, set.Queue), cfg.seedSpec, args); seedErr != nil {
 			return seedErr
 		}
-	} else {
+	} else if set.Name == adapters.BackendMemory {
+		// The in-memory queue lives in this process, so it starts empty and
+		// nothing else can put anything in it. On the AWS backend the queue is
+		// shared, and idling until work arrives is exactly the job.
 		logger.Info("no images given, so this worker will idle",
 			slog.String("reason", "the in-memory queue lives in this process and starts empty"),
-			slog.String("hint", "pass image paths to submit jobs: go run ./cmd/worker photo.png"))
+			slog.String("hint", "pass image paths, or set IMAGEFORGE_BACKEND=aws to share a queue"))
 	}
 
 	// Run blocks until a signal arrives, then drains what is in flight.
@@ -132,6 +137,7 @@ func seed(
 
 // config holds the runtime settings, all overridable by environment variable.
 type config struct {
+	backend         string
 	storageDir      string
 	watermarkText   string
 	poolSize        int
@@ -146,6 +152,7 @@ type config struct {
 // configuration at all.
 func loadConfig() config {
 	return config{
+		backend:         adapters.BackendFromEnv(),
 		storageDir:      envString("IMAGEFORGE_STORAGE_DIR", ".data/storage"),
 		watermarkText:   envString("IMAGEFORGE_WATERMARK_TEXT", imageproc.DefaultWatermarkText),
 		poolSize:        int(envInt64("IMAGEFORGE_WORKERS", worker.DefaultSize)),

@@ -19,10 +19,9 @@ import (
 	"syscall"
 	"time"
 
+	"imageforge/internal/adapters"
 	"imageforge/internal/adapters/httpapi"
-	"imageforge/internal/adapters/localstorage"
 	"imageforge/internal/adapters/memqueue"
-	"imageforge/internal/adapters/memrepo"
 	"imageforge/internal/usecase"
 )
 
@@ -50,17 +49,23 @@ func run() error {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.logLevel}))
 	slog.SetDefault(logger)
 
-	storage, err := localstorage.New(cfg.storageDir)
+	// Signals are trapped before anything is opened, so a Ctrl-C during
+	// startup is still handled by the graceful path.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	set, err := adapters.Open(ctx, cfg.backend, adapters.Config{
+		StorageDir:  cfg.storageDir,
+		QueueBuffer: cfg.queueBuffer,
+	})
 	if err != nil {
-		return fmt.Errorf("storage: %w", err)
+		return err
 	}
-	queue := memqueue.New(cfg.queueBuffer)
-	defer queue.Close()
-	jobs := memrepo.New()
+	defer set.Close()
 
 	api := httpapi.New(
-		usecase.NewCreateJob(storage, jobs, queue),
-		jobs,
+		usecase.NewCreateJob(set.Storage, set.Jobs, set.Queue),
+		set.Jobs,
 		httpapi.Config{
 			Logger:         logger,
 			MaxUploadBytes: cfg.maxUploadBytes,
@@ -79,16 +84,12 @@ func run() error {
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}
 
-	// Signals must be trapped before the listener opens, so a fast Ctrl-C is
-	// still handled gracefully.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
 	serveErr := make(chan error, 1)
 	go func() {
 		logger.Info("api listening",
 			slog.String("addr", cfg.addr),
-			slog.String("storage_dir", storage.Root()))
+			slog.String("backend", set.Name),
+			slog.String("adapters", set.Description))
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serveErr <- err
 			return
@@ -125,6 +126,7 @@ func run() error {
 
 // config holds the runtime settings, all overridable by environment variable.
 type config struct {
+	backend        string
 	addr           string
 	storageDir     string
 	publicBaseURL  string
@@ -138,6 +140,7 @@ type config struct {
 // configuration at all.
 func loadConfig() config {
 	cfg := config{
+		backend:        adapters.BackendFromEnv(),
 		addr:           envString("IMAGEFORGE_ADDR", ":8080"),
 		storageDir:     envString("IMAGEFORGE_STORAGE_DIR", ".data/storage"),
 		publicBaseURL:  envString("IMAGEFORGE_PUBLIC_BASE_URL", ""),
