@@ -33,6 +33,10 @@ internal/usecase         Application business rules
 internal/ports           Interfaces consumed by the use cases
 internal/worker          Goroutine pool draining the job queue
 internal/adapters        Infrastructure implementations of the ports
+  awscfg                 AWS client construction from the environment
+  s3storage              Storage on S3
+  sqsqueue               Queue on SQS (long polling, delete-on-success)
+  dynamorepo             JobRepository on DynamoDB
   httpapi                HTTP transport (chi router, middleware)
   localstorage           Filesystem-backed Storage
   memqueue               In-memory Queue
@@ -41,6 +45,7 @@ internal/adapters        Infrastructure implementations of the ports
 web/                     Front-end assets
 deployments/terraform    Infrastructure as code
 deployments/docker       Container build files
+test/integration         End-to-end tests against LocalStack
 .github/workflows        CI pipelines
 ```
 
@@ -153,6 +158,62 @@ make run-worker                            # no arguments: idles until stopped
 | `IMAGEFORGE_SEED_FORMAT`      | `jpeg`          | Output format for seeded jobs    |
 | `IMAGEFORGE_SEED_WIDTH`       | `640`           | Output width for seeded jobs     |
 | `IMAGEFORGE_SEED_QUALITY`     | `80`            | Output quality for seeded jobs   |
+
+## Backends
+
+`IMAGEFORGE_BACKEND` selects which adapters the binaries wire up. Both satisfy
+the same ports, so nothing above `internal/adapters` changes with the choice.
+
+| Backend            | Storage     | Queue           | Jobs        |
+| ------------------ | ----------- | --------------- | ----------- |
+| `memory` (default) | filesystem  | in-memory chan  | in-memory   |
+| `aws`              | S3          | SQS             | DynamoDB    |
+
+The AWS backend talks to LocalStack when `AWS_ENDPOINT_URL` is set, and to real
+AWS when it is not; nothing else differs.
+
+```sh
+make aws-up                          # start LocalStack and create the resources
+export IMAGEFORGE_BACKEND=aws
+export AWS_ENDPOINT_URL=http://localhost:4566
+export AWS_REGION=eu-west-1
+export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test
+make run-api                         # one terminal
+make run-worker                      # another
+```
+
+| Variable                   | Default            | Purpose                         |
+| -------------------------- | ------------------ | ------------------------------- |
+| `IMAGEFORGE_BACKEND`       | `memory`           | `memory` or `aws`               |
+| `AWS_ENDPOINT_URL`         | unset              | Endpoint override for LocalStack |
+| `AWS_REGION`               | `eu-west-1`        | AWS region                      |
+| `IMAGEFORGE_S3_BUCKET`     | `imageforge-media` | Bucket for originals and results |
+| `IMAGEFORGE_SQS_QUEUE`     | `imageforge-jobs`  | Job queue name                  |
+| `IMAGEFORGE_DYNAMODB_TABLE`| `imageforge-jobs`  | Job state table                 |
+
+### Local AWS resources
+
+`deployments/docker/localstack-init.sh` creates the bucket, the queue, its
+dead-letter queue and the table. LocalStack runs it on startup — docker-compose
+mounts it into `/etc/localstack/init/ready.d` — and `make aws-init` runs it by
+hand. Every step is idempotent.
+
+The queue carries a redrive policy, so a message that fails five times moves to
+`imageforge-jobs-dlq` instead of cycling forever. Deliveries are settled
+explicitly: the worker deletes a message once its job is done and returns it to
+the queue otherwise, through the optional `ports.Acknowledger` interface that
+`sqsqueue` implements and `memqueue` does not.
+
+### Integration tests
+
+`test/integration` runs the API and the worker against LocalStack and checks the
+whole upload → process → result flow. It is behind the `integration` build tag,
+and skips itself when no stack is reachable.
+
+```sh
+make aws-up
+make test-integration
+```
 ## Image processing backends
 
 `internal/adapters/imageproc` implements the `ImageProcessor` port twice, with
@@ -176,8 +237,8 @@ make test TEST_FLAGS='-tags nogovips -count=1'
 ```
 ## Status
 
-Work in progress. The domain model, ports and use cases are in place and unit
-tested. The image processing adapter is implemented on both backends, and the
-HTTP API and the worker pool run on in-process adapters with no external
-services. The AWS adapters (S3, SQS, DynamoDB) and the deployment
-infrastructure are not implemented yet.
+Work in progress. The domain model, ports, use cases, HTTP API and worker pool
+are in place and tested, on two interchangeable backends: in-process adapters
+that need nothing external, and S3, SQS and DynamoDB, verified end to end
+against LocalStack. The Terraform deployment and the web front-end are not
+implemented yet.
