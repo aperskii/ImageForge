@@ -43,14 +43,12 @@ pnpm-debug.log*
 *.key
 
 # ---------- Terraform ----------
-.terraform/
 *.tfstate
 *.tfstate.*
 *.tfvars
 !*.tfvars.example
 crash.log
 crash.*.log
-.terraform.lock.hcl
 
 # ---------- Local runtime data ----------
 .data/
@@ -82,3 +80,7 @@ volume/
 Thumbs.db
 ehthumbs.db
 Desktop.ini
+
+# ---------- Terraform provider cache and state ----------
+**/.terraform/
+**/.terraform.lock.hcl
