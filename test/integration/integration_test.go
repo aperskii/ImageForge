@@ -55,6 +55,7 @@ const defaultEndpoint = "http://localhost:4566"
 // stack is the whole pipeline running on the AWS adapters, with the API served
 // by httptest and the worker pool running in the background.
 type stack struct {
+	token    string
 	settings awscfg.Settings
 	storage  *s3storage.Storage
 	queue    *sqsqueue.Queue
@@ -96,11 +97,21 @@ func newStack(t *testing.T, opts ...worker.Option) *stack {
 	processor, err := imageproc.New()
 	require.NoError(t, err, "the %s backend must be usable", imageproc.Backend)
 
+	key, err := httpapi.GenerateKey()
+	require.NoError(t, err)
+	issuer, err := httpapi.NewIssuer(key)
+	require.NoError(t, err)
+
 	api := httpapi.New(
 		usecase.NewCreateJob(storage, jobs, queue),
 		jobs,
+		issuer,
 		httpapi.Config{Logger: discardLogger(), PublicBaseURL: "https://cdn.example.test"},
 	)
+	t.Cleanup(api.Close)
+
+	token, err := issuer.Issue("integration-suite")
+	require.NoError(t, err)
 	server := httptest.NewServer(api.Routes())
 	t.Cleanup(server.Close)
 
@@ -125,6 +136,7 @@ func newStack(t *testing.T, opts ...worker.Option) *stack {
 	})
 
 	return &stack{
+		token:    token,
 		settings: settings,
 		storage:  storage,
 		queue:    queue,
@@ -213,6 +225,7 @@ func (s *stack) upload(t *testing.T, source []byte, spec string) jobResponse {
 		http.MethodPost, s.server.URL+"/uploads", &body)
 	require.NoError(t, err)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+s.token)
 
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
@@ -233,6 +246,7 @@ func (s *stack) getJob(t *testing.T, id string) (job jobResponse, statusCode int
 	req, err := http.NewRequestWithContext(t.Context(),
 		http.MethodGet, s.server.URL+"/jobs/"+id, http.NoBody)
 	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+s.token)
 
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
@@ -421,11 +435,11 @@ func TestAPIValidationAgainstAWS(t *testing.T) {
 	tests := []struct {
 		name     string
 		spec     string
-		wantCode string
+		wantType string
 	}{
-		{name: "unsupported format", spec: `{"width":32,"format":"gif"}`, wantCode: "invalid_transformation"},
-		{name: "no dimension", spec: `{"format":"png"}`, wantCode: "invalid_transformation"},
-		{name: "malformed json", spec: `{"width":`, wantCode: "invalid_spec"},
+		{name: "unsupported format", spec: `{"width":32,"format":"gif"}`, wantType: httpapi.TypeInvalidTransform},
+		{name: "no dimension", spec: `{"format":"png"}`, wantType: httpapi.TypeInvalidTransform},
+		{name: "malformed json", spec: `{"width":`, wantType: httpapi.TypeInvalidSpec},
 	}
 
 	for _, tt := range tests {
@@ -443,6 +457,7 @@ func TestAPIValidationAgainstAWS(t *testing.T) {
 				http.MethodPost, stack.server.URL+"/uploads", &body)
 			require.NoError(t, err)
 			req.Header.Set("Content-Type", writer.FormDataContentType())
+			req.Header.Set("Authorization", "Bearer "+stack.token)
 
 			resp, err := http.DefaultClient.Do(req)
 			require.NoError(t, err)
@@ -450,15 +465,13 @@ func TestAPIValidationAgainstAWS(t *testing.T) {
 
 			require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 
-			var errBody struct {
-				Error struct {
-					Code      string `json:"code"`
-					RequestID string `json:"request_id"`
-				} `json:"error"`
-			}
-			require.NoError(t, json.NewDecoder(resp.Body).Decode(&errBody))
-			assert.Equal(t, tt.wantCode, errBody.Error.Code)
-			assert.NotEmpty(t, errBody.Error.RequestID)
+			assert.Equal(t, httpapi.ProblemContentType, resp.Header.Get("Content-Type"))
+
+			var problem httpapi.Problem
+			require.NoError(t, json.NewDecoder(resp.Body).Decode(&problem))
+			assert.Equal(t, tt.wantType, problem.Type)
+			assert.Equal(t, http.StatusBadRequest, problem.Status)
+			assert.NotEmpty(t, problem.RequestID)
 		})
 	}
 }
@@ -605,4 +618,25 @@ func readObject(t *testing.T, s *stack, key string) string {
 	content, err := io.ReadAll(object)
 	require.NoError(t, err)
 	return string(content)
+}
+
+// TestUnauthorizedAgainstAWS checks the auth boundary holds with the real
+// adapters behind it, not just in the unit tests.
+func TestUnauthorizedAgainstAWS(t *testing.T) {
+	stack := newStack(t)
+
+	req, err := http.NewRequestWithContext(t.Context(),
+		http.MethodGet, stack.server.URL+"/jobs/whatever", http.NoBody)
+	require.NoError(t, err)
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	assert.Contains(t, resp.Header.Get("WWW-Authenticate"), "Bearer")
+
+	var problem httpapi.Problem
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&problem))
+	assert.Equal(t, httpapi.TypeUnauthorized, problem.Type)
 }

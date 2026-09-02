@@ -15,6 +15,7 @@ export default defineConfig({
     // development. In production these are served behind one hostname.
     proxy: {
       "/uploads": { target: apiTarget, changeOrigin: true },
+      "/auth": { target: apiTarget, changeOrigin: true },
       "/jobs": { target: apiTarget, changeOrigin: true },
       "/healthz": { target: apiTarget, changeOrigin: true },
       "/readyz": { target: apiTarget, changeOrigin: true },

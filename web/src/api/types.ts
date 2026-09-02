@@ -51,11 +51,31 @@ export interface Job {
   error?: string;
 }
 
-/** The body the API returns for any non-2xx response. */
-export interface ApiErrorBody {
-  error: {
-    code: string;
-    message: string;
-    request_id?: string;
-  };
+/**
+ * An RFC 7807 problem detail, the body of every non-2xx response.
+ *
+ * `type` is the stable identifier to switch on; `title` and `detail` are prose.
+ * `request_id` and `retry_after` are extension members the API adds.
+ */
+export interface Problem {
+  type: string;
+  title: string;
+  status: number;
+  detail?: string;
+  instance?: string;
+  request_id?: string;
+  retry_after?: number;
+}
+
+/** Problem types this app treats specially. */
+export const PROBLEM_BASE = "https://imageforge.dev/problems/";
+export const PROBLEM_RATE_LIMITED = `${PROBLEM_BASE}rate-limited`;
+export const PROBLEM_UNSUPPORTED_MEDIA = `${PROBLEM_BASE}unsupported-media-type`;
+export const PROBLEM_PAYLOAD_TOO_LARGE = `${PROBLEM_BASE}payload-too-large`;
+
+/** The body of a successful POST /auth/token. */
+export interface TokenResponse {
+  access_token: string;
+  token_type: string;
+  expires_in: number;
 }

@@ -70,11 +70,13 @@ make lint         # run golangci-lint
 
 ## API
 
-The API accepts an upload, stores it, queues a job and reports on it. Nothing
-drains the queue yet, so jobs stay `pending` until the worker is implemented.
+The API accepts an upload, stores it, queues a job and reports on it. Every
+route that touches a job needs a bearer token; see [Authentication and
+limits](#authentication-and-limits).
 
 | Method | Path         | Purpose                                        |
 | ------ | ------------ | ---------------------------------------------- |
+| `POST` | `/auth/token` | Issue a bearer token (demo credential flow)    |
 | `POST` | `/uploads`   | Multipart upload, returns `202` with the job   |
 | `GET`  | `/jobs/{id}` | Job status, and the result URL once done       |
 | `GET`  | `/healthz`   | Liveness, no dependency checks                 |
@@ -85,6 +87,7 @@ carrying the transformation as JSON:
 
 ```sh
 curl -X POST http://localhost:8080/uploads \
+  -H "Authorization: Bearer $TOKEN" \
   -F 'file=@photo.png' \
   -F 'spec={"width":320,"format":"webp","quality":80,"strip_metadata":true}'
 ```
@@ -100,15 +103,11 @@ curl -X POST http://localhost:8080/uploads \
 }
 ```
 
-Errors carry a stable code and the request id, which also appears in the
-`X-Request-Id` header and in the server log:
-
-```json
-{"error":{"code":"invalid_transformation","message":"...","request_id":"..."}}
-```
+Errors are RFC 7807 problem details; see [Errors](#errors) below.
 
 Every request passes through request ID, structured `log/slog` logging, panic
-recovery, a 10MB body limit and CORS.
+recovery, a 10MB body limit and CORS. Job routes additionally pass through
+bearer-token authentication and a per-client rate limiter.
 
 ### Configuration
 
@@ -124,6 +123,75 @@ recovery, a 10MB body limit and CORS.
 | `IMAGEFORGE_QUEUE_BUFFER`     | `1024`           | In-memory queue depth                  |
 | `IMAGEFORGE_LOG_LEVEL`        | `INFO`           | `DEBUG`, `INFO`, `WARN`, `ERROR`       |
 
+
+## Authentication and limits
+
+`/uploads` and `/jobs/{id}` require a bearer token. `/healthz` and `/readyz` do
+not: a load balancer cannot hold a credential, and a liveness probe that can
+fail on authentication is worse than useless.
+
+```sh
+TOKEN=$(curl -s -X POST localhost:8080/auth/token \
+  -H 'Content-Type: application/json' \
+  -d '{"client_id":"demo"}' | jq -r .access_token)
+
+curl -X POST localhost:8080/uploads -H "Authorization: Bearer $TOKEN" \
+  -F 'file=@photo.png' -F 'spec={"width":320,"format":"webp","quality":80}'
+```
+
+**`/auth/token` is a demonstration credential flow, not an identity system.**
+With no `IMAGEFORGE_CLIENT_SECRET` set it issues a token to whoever asks, and
+says so in a startup warning. What it does do properly is the part that matters
+for the middleware consuming those tokens: HS256 with a pinned algorithm, a
+checked issuer, a required expiry, and a constant-time secret comparison.
+
+There is no default signing key. With `IMAGEFORGE_JWT_KEY` unset the server
+generates a random one per process, so tokens stop working across a restart —
+an ephemeral key nobody knows is safer than a default key that ships in the
+source and reaches production.
+
+Requests are rate limited per authenticated client with a token bucket, keyed on
+the token's subject rather than on an address or header a caller can change. Over
+budget returns `429` with `Retry-After`. Idle buckets are evicted, since an
+unbounded map keyed by client is itself a way to attack the server.
+
+| Variable                     | Default | Purpose                                  |
+| ---------------------------- | ------- | ---------------------------------------- |
+| `IMAGEFORGE_JWT_KEY`         | random  | 32+ bytes, hex-encoded, for signing      |
+| `IMAGEFORGE_CLIENT_SECRET`   | unset   | Required from clients when set           |
+| `IMAGEFORGE_TOKEN_TTL`       | `1h`    | Token lifetime                           |
+| `IMAGEFORGE_RATE_LIMIT`      | `5`     | Sustained requests per second per client |
+| `IMAGEFORGE_RATE_BURST`      | `20`    | Back-to-back requests allowed            |
+
+### Errors
+
+Every non-2xx response is an RFC 7807 problem detail, served as
+`application/problem+json`:
+
+```json
+{
+  "type": "https://imageforge.dev/problems/rate-limited",
+  "title": "Too Many Requests",
+  "status": 429,
+  "detail": "This client is over its budget of 5 requests per second. Retry in 1 second(s).",
+  "instance": "/uploads",
+  "request_id": "…",
+  "retry_after": 1
+}
+```
+
+`type` is the stable identifier to switch on; `title` and `detail` are prose and
+may be reworded. `request_id` and `retry_after` are extension members: the first
+also appears in the server log, so a screenshot from a user is enough to find
+the request.
+
+### Upload validation
+
+An upload is checked before any work is queued: the body is capped at 10MB, and
+the media type is decided by **sniffing the leading bytes**, not by the
+`Content-Type` the client declares. A shell script named `photo.png` and
+labelled `image/png` is still rejected with `415`. Accepted source types are
+JPEG, PNG, WebP, GIF, AVIF and BMP.
 ## Worker
 
 `internal/worker` runs a fixed pool of goroutines, each pulling job identifiers

@@ -20,7 +20,7 @@ npm install
 npm run dev       # http://localhost:5173
 ```
 
-Vite proxies `/uploads`, `/jobs`, `/healthz` and `/readyz` to
+Vite proxies `/uploads`, `/jobs`, `/auth`, `/healthz` and `/readyz` to
 `http://localhost:8080`, so the browser only ever makes same-origin requests and
 CORS never comes into it. Point it somewhere else with `IMAGEFORGE_API_URL`:
 
@@ -69,9 +69,9 @@ background, because a job takes seconds and someone who switched away should
 find the result waiting rather than a stale spinner. A job that never settles is
 abandoned after five minutes rather than polled forever.
 
-**Errors.** The API's error body carries a stable `code` and a `request_id` that
-also appears in the server log, and the UI shows the request ID on failure, so a
-screenshot from a user is enough to find the request.
+**Errors.** The API answers with RFC 7807 problem details. `type` is the stable
+field the client switches on; the UI shows the `request_id`, which also appears
+in the server log, so a screenshot from a user is enough to find the request.
 
 **History.** The gallery lives in `localStorage`: the API has no per-user job
 listing, so history is local to one browser and disappears with its site data.
@@ -83,3 +83,18 @@ readable.
 — no dimension set, a quality on lossless PNG, dimensions over the API's 10000px
 limit — so they do not cost a round trip. The server validates again and remains
 the authority.
+
+## Authentication
+
+The API requires a bearer token on `/uploads` and `/jobs/{id}`. The app fetches
+one from `POST /auth/token` on its first request and keeps it **in memory**, not
+in `localStorage`: a credential in storage is readable by any script that gets
+injected into the page, and this one is cheap to replace.
+
+If the server says a token is no longer good — it expired, or the server
+restarted with a new ephemeral signing key — the client fetches a fresh one and
+retries the request once. That silent retry is the difference between an app
+that keeps working and one that fails until reloaded.
+
+A `429` surfaces the `Retry-After` the API returned, so the message says when to
+try again rather than just that something went wrong.

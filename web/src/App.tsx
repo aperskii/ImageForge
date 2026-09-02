@@ -127,6 +127,12 @@ export default function App() {
                   <p className="font-medium text-red-900 dark:text-red-200">
                     {formError ?? createJob.error?.message}
                   </p>
+                  {createJob.error?.isRateLimited && createJob.error.retryAfter && (
+                    <p className="mt-1 text-sm text-red-800 dark:text-red-300">
+                      Too many requests. Try again in {createJob.error.retryAfter} second
+                      {createJob.error.retryAfter === 1 ? "" : "s"}.
+                    </p>
+                  )}
                   {createJob.error?.requestId && (
                     <p className="mt-1 font-mono text-xs text-red-700 dark:text-red-400">
                       Request ID: {createJob.error.requestId}
