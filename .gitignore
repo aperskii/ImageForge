@@ -1,0 +1,84 @@
+# ---------- Go ----------
+bin/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.*
+vendor/
+go.work
+go.work.sum
+
+# ---------- Node / web ----------
+node_modules/
+.pnp
+.pnp.js
+.npm
+.yarn/*
+!.yarn/patches
+!.yarn/releases
+!.yarn/plugins
+!.yarn/sdks
+!.yarn/versions
+web/dist/
+web/build/
+web/.next/
+web/.nuxt/
+web/.vite/
+web/.turbo/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---------- Environment / secrets ----------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---------- Terraform ----------
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+crash.*.log
+.terraform.lock.hcl
+
+# ---------- Local runtime data ----------
+.data/
+
+# ---------- LocalStack ----------
+.localstack/
+volume/
+
+# ---------- IDE / editors ----------
+.idea/
+.vscode/
+!.vscode/extensions.json
+*.iml
+*.ipr
+*.iws
+*.swp
+*.swo
+*~
+.history/
+*.sublime-workspace
+*.sublime-project
+
+# ---------- OS ----------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini

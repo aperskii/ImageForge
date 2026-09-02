@@ -1,0 +1,134 @@
+# golangci-lint configuration for ImageForge (schema v2).
+# Strict by default: new code is expected to pass without nolint directives.
+version: "2"
+
+run:
+  tests: true
+  allow-parallel-runners: true
+
+linters:
+  default: none
+  enable:
+    # Core, non-negotiable set.
+    - errcheck
+    - govet
+    - staticcheck
+    - revive
+    - ineffassign
+    - unused
+    # Extra strictness.
+    - bodyclose
+    - contextcheck
+    - errorlint
+    - goconst
+    - gocritic
+    - gosec
+    - misspell
+    - nilerr
+    - noctx
+    - rowserrcheck
+    - unconvert
+    - unparam
+    - wastedassign
+    - whitespace
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+      # check-blank stays off: an explicit "_ =" is how deliberate discards are
+      # written, and forcing a nolint on each one is noisier than the discard.
+      check-blank: false
+      exclude-functions:
+        - (io.Closer).Close
+
+    govet:
+      enable-all: true
+      disable:
+        # Too noisy while the domain types are still taking shape.
+        - fieldalignment
+
+    staticcheck:
+      checks:
+        - all
+
+    revive:
+      severity: warning
+      confidence: 0.8
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: early-return
+        - name: error-naming
+        - name: error-return
+        - name: error-strings
+        - name: errorf
+        - name: exported
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: package-comments
+        - name: range
+        - name: receiver-naming
+        - name: redefines-builtin-id
+        - name: superfluous-else
+        - name: time-naming
+        - name: unexported-return
+        - name: unreachable-code
+        - name: unused-parameter
+        - name: var-declaration
+        - name: var-naming
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - performance
+        - style
+      disabled-checks:
+        - whyNoLint
+
+    goconst:
+      min-len: 3
+      min-occurrences: 3
+
+    misspell:
+      locale: US
+
+  exclusions:
+    generated: lax
+    rules:
+      # Tests may be noisier: allow unchecked errors and magic values.
+      - path: _test.go
+        linters:
+          - errcheck
+          - goconst
+          - gosec
+          - noctx
+          - unparam
+      # Test doubles rely on comma-ok assertions over mock.Arguments.
+      - path: internal/ports/mocks/
+        linters:
+          - errcheck
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - imageforge
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

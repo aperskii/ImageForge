@@ -1,0 +1,19 @@
+# Normalize to LF in the repository, and let Git pick the working-copy ending.
+* text=auto
+
+# Files that must keep LF even on a Windows checkout: make and the shell are
+# unforgiving about carriage returns.
+Makefile        text eol=lf
+*.mk            text eol=lf
+*.sh            text eol=lf
+Dockerfile*     text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+
+# Binary fixtures: never touch these.
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.webp          binary
+*.avif          binary
+*.gif           binary
