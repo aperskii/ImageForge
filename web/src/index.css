@@ -1,0 +1,13 @@
+@import "tailwindcss";
+
+/* Tailwind's default `dark:` variant already follows prefers-color-scheme, so
+   the theme tracks the reader's system setting with no toggle to maintain.
+   color-scheme tells the browser to match its own form controls and scrollbars. */
+:root {
+  color-scheme: light dark;
+}
+
+html,
+body {
+  height: 100%;
+}

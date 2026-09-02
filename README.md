@@ -43,7 +43,7 @@ internal/adapters        Infrastructure implementations of the ports
   memqueue               In-memory Queue
   memrepo                In-memory JobRepository
   imageproc              Image processing (govips, or pure Go via -tags nogovips)
-web/                     Front-end assets
+web/                     Vite + React front-end (see web/README.md)
 deployments/terraform    Infrastructure as code
 deployments/docker       Container build files
 test/integration         End-to-end tests against LocalStack
@@ -52,7 +52,8 @@ test/integration         End-to-end tests against LocalStack
 
 ## Getting started
 
-Requirements: Go 1.23+, Docker (with Compose), `golangci-lint`, and libvips 8.10+
+Requirements: Go 1.24+, Node 20+, Docker (with Compose), `golangci-lint`, and
+libvips 8.10+
 (`libvips-dev` on Debian/Ubuntu, `brew install vips` on macOS). To build without
 libvips, see [Image processing backends](#image-processing-backends).
 
