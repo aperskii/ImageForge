@@ -57,6 +57,7 @@ type Pool struct {
 
 	size            int
 	logger          *slog.Logger
+	observer        Observer
 	shutdownTimeout time.Duration
 	jobTimeout      time.Duration
 
@@ -64,6 +65,27 @@ type Pool struct {
 	failed    atomic.Uint64
 	skipped   atomic.Uint64
 }
+
+// Observer receives the outcome of every job the pool handles.
+//
+// It is an interface, rather than a metrics client, so this package can be
+// instrumented without depending on whichever one is in use. Status is one of
+// the StatusX constants below.
+type Observer interface {
+	JobFinished(status string, d time.Duration)
+}
+
+// The outcomes reported to an Observer.
+const (
+	StatusProcessed = "processed"
+	StatusFailed    = "failed"
+	StatusSkipped   = "skipped"
+)
+
+// nopObserver is the default, so the pool never has to check for nil.
+type nopObserver struct{}
+
+func (nopObserver) JobFinished(string, time.Duration) {}
 
 // Option overrides a Pool setting.
 type Option func(*Pool)
@@ -97,6 +119,16 @@ func WithShutdownTimeout(d time.Duration) Option {
 	}
 }
 
+// WithObserver installs an observer for job outcomes. A nil observer leaves the
+// default no-op in place.
+func WithObserver(o Observer) Option {
+	return func(p *Pool) {
+		if o != nil {
+			p.observer = o
+		}
+	}
+}
+
 // WithJobTimeout bounds a single job. A non-positive duration removes the
 // bound, letting a job run until the pool shuts down.
 func WithJobTimeout(d time.Duration) Option {
@@ -110,6 +142,7 @@ func New(queue ports.Queue, process *usecase.ProcessJob, opts ...Option) *Pool {
 		process:         process,
 		size:            DefaultSize,
 		logger:          slog.Default(),
+		observer:        nopObserver{},
 		shutdownTimeout: DefaultShutdownTimeout,
 		jobTimeout:      DefaultJobTimeout,
 	}
@@ -239,15 +272,18 @@ func (p *Pool) handle(ctx context.Context, workerID int, jobID string) {
 	switch {
 	case errors.Is(err, usecase.ErrJobNotPending):
 		p.skipped.Add(1)
+		p.observer.JobFinished(StatusSkipped, elapsed)
 		p.logger.DebugContext(ctx, "job skipped",
 			slog.Int("worker", workerID),
 			slog.String("job_id", jobID),
+			slog.Duration("duration", elapsed),
 			slog.String("reason", err.Error()))
 		// A duplicate delivery is settled, not retried: redelivering it would
 		// only produce the same skip.
 		p.settle(ctx, workerID, jobID, true)
 	case err != nil:
 		p.failed.Add(1)
+		p.observer.JobFinished(StatusFailed, elapsed)
 		p.logger.ErrorContext(ctx, "job failed",
 			slog.Int("worker", workerID),
 			slog.String("job_id", jobID),
@@ -256,6 +292,7 @@ func (p *Pool) handle(ctx context.Context, workerID int, jobID string) {
 		p.settle(ctx, workerID, jobID, false)
 	default:
 		p.processed.Add(1)
+		p.observer.JobFinished(StatusProcessed, elapsed)
 		p.logger.InfoContext(ctx, "job processed",
 			slog.Int("worker", workerID),
 			slog.String("job_id", jobID),

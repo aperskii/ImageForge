@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
+	"time"
 
 	"imageforge/internal/adapters/awscfg"
 	"imageforge/internal/adapters/dynamorepo"
@@ -47,6 +49,26 @@ type Set struct {
 
 	// Close releases anything the set holds. It is never nil.
 	Close func()
+}
+
+// ReceiveErrorHandler is notified whenever reading from the queue fails, with
+// the consecutive failure count and the delay before the next attempt.
+//
+// It is a package variable rather than a field on Config because it is wired
+// once per process, in main, and only the AWS backend has anything to report.
+var ReceiveErrorHandler = func(err error, attempt int, delay time.Duration) {
+	slog.Warn("reading from the queue failed, backing off",
+		slog.Int("attempt", attempt),
+		slog.Duration("retry_in", delay),
+		slog.String("error", err.Error()))
+}
+
+// onReceiveError forwards to the installed handler, so replacing the variable
+// after a queue was built still takes effect.
+func onReceiveError(err error, attempt int, delay time.Duration) {
+	if ReceiveErrorHandler != nil {
+		ReceiveErrorHandler(err, attempt, delay)
+	}
 }
 
 // Config holds the settings the in-process adapters need. The AWS adapters read
@@ -114,7 +136,8 @@ func openAWS(ctx context.Context) (*Set, error) {
 	if err != nil {
 		return nil, fmt.Errorf("adapters: %w", err)
 	}
-	queue, err := sqsqueue.New(ctx, awscfg.SQS(cfg, settings), settings.Queue)
+	queue, err := sqsqueue.New(ctx, awscfg.SQS(cfg, settings), settings.Queue,
+		sqsqueue.WithReceiveErrorHandler(onReceiveError))
 	if err != nil {
 		return nil, fmt.Errorf("adapters: %w", err)
 	}

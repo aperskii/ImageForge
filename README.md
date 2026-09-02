@@ -32,6 +32,7 @@ internal/domain          Entities and value objects
 internal/usecase         Application business rules
 internal/ports           Interfaces consumed by the use cases
 internal/worker          Goroutine pool draining the job queue
+internal/metrics         Prometheus collectors and the /metrics endpoint
 internal/adapters        Infrastructure implementations of the ports
   awscfg                 AWS client construction from the environment
   s3storage              Storage on S3
@@ -159,6 +160,44 @@ make run-worker                            # no arguments: idles until stopped
 | `IMAGEFORGE_SEED_WIDTH`       | `640`           | Output width for seeded jobs     |
 | `IMAGEFORGE_SEED_QUALITY`     | `80`            | Output quality for seeded jobs   |
 
+
+### Observability
+
+The worker serves Prometheus metrics on its own listener, separate from any
+application port so it can be firewalled off independently.
+
+| Metric                                    | Type      | Labels   |
+| ----------------------------------------- | --------- | -------- |
+| `imageforge_jobs_processed_total`         | counter   | `status` |
+| `imageforge_processing_duration_seconds`  | histogram | `status` |
+| `imageforge_queue_depth`                  | gauge     | —        |
+| `imageforge_queue_receive_errors_total`   | counter   | —        |
+
+`status` is `processed`, `failed` or `skipped`. All three are published at zero
+from startup, so an alert on `rate(...)` is evaluable before the first failure
+rather than silently matching nothing. The duration buckets span 10ms to 60s,
+which is the range image work actually covers.
+
+`queue_depth` is refreshed on a timer from the queue itself, and is advisory:
+SQS reports an approximation, and it is stale by the time it is read.
+
+```sh
+curl localhost:9090/metrics
+```
+
+### Reading from the queue
+
+A failed receive is retried with exponential backoff and full jitter: the delay
+doubles per consecutive failure up to a ceiling, and the actual wait is drawn
+from `[0, delay)` so a fleet of workers that lost the queue together does not
+come back in lockstep and stampede it. One success resets the sequence. The
+consumer never gives up, because a queue coming back should find a worker still
+waiting for it.
+
+| Variable                          | Default | Purpose                        |
+| --------------------------------- | ------- | ------------------------------ |
+| `IMAGEFORGE_METRICS_ADDR`         | `:9090` | Metrics listener               |
+| `IMAGEFORGE_QUEUE_DEPTH_INTERVAL` | `15s`   | How often the gauge is refreshed |
 ## Backends
 
 `IMAGEFORGE_BACKEND` selects which adapters the binaries wire up. Both satisfy

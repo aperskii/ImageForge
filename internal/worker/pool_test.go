@@ -654,3 +654,121 @@ func TestPoolWithoutAcknowledgerIsFine(t *testing.T) {
 	cancel()
 	require.NoError(t, <-runErr)
 }
+
+// recordingObserver captures the outcomes the pool reports.
+type recordingObserver struct {
+	mu      sync.Mutex
+	entries []observation
+}
+
+type observation struct {
+	status   string
+	duration time.Duration
+}
+
+func (o *recordingObserver) JobFinished(status string, d time.Duration) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.entries = append(o.entries, observation{status: status, duration: d})
+}
+
+func (o *recordingObserver) snapshot() []observation {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]observation(nil), o.entries...)
+}
+
+// TestPoolReportsOutcomesToTheObserver covers the instrumentation hook: every
+// job reports its outcome and how long it took, which is what the metrics are
+// built from.
+func TestPoolReportsOutcomesToTheObserver(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		processor  ports.ImageProcessor
+		enqueueDup bool
+		wantStatus string
+		// wantTimed is set where real work happens and the duration must
+		// therefore register on the clock. A skip returns as soon as the
+		// repository says the job is not pending, which can measure zero.
+		wantTimed bool
+	}{
+		{name: "a processed job", wantStatus: StatusProcessed, wantTimed: true},
+		{name: "a failed job", processor: &failingProcessor{}, wantStatus: StatusFailed},
+		{name: "a duplicate delivery", enqueueDup: true, wantStatus: StatusSkipped},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			storage, err := localstorage.New(t.TempDir())
+			require.NoError(t, err)
+			queue := memqueue.New(4)
+			t.Cleanup(queue.Close)
+			jobs := memrepo.New()
+
+			processor := tt.processor
+			if processor == nil {
+				processor, err = imageproc.New()
+				require.NoError(t, err)
+			}
+
+			observer := &recordingObserver{}
+			createJob := usecase.NewCreateJob(storage, jobs, queue)
+			pool := New(queue, usecase.NewProcessJob(storage, jobs, processor),
+				WithSize(1), WithLogger(discardLogger()), WithObserver(observer))
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			job, err := createJob.Execute(ctx, usecase.CreateJobInput{
+				Source: bytes.NewReader(samplePNG(t, 32, 32)),
+				Spec:   domain.TransformationSpec{Width: 16, Format: domain.FormatPNG},
+			})
+			require.NoError(t, err)
+
+			if tt.enqueueDup {
+				require.NoError(t, queue.Enqueue(ctx, job.ID))
+			}
+
+			runErr := make(chan error, 1)
+			go func() { runErr <- pool.Run(ctx) }()
+
+			require.Eventuallyf(t, func() bool {
+				for _, entry := range observer.snapshot() {
+					if entry.status == tt.wantStatus {
+						return true
+					}
+				}
+				return false
+			}, 30*time.Second, 10*time.Millisecond, "observations: %+v", observer.snapshot())
+
+			var found bool
+			for _, entry := range observer.snapshot() {
+				if entry.status == tt.wantStatus {
+					found = true
+					assert.GreaterOrEqual(t, entry.duration, time.Duration(0))
+					if tt.wantTimed {
+						assert.Positive(t, entry.duration, "real work must register on the clock")
+					}
+				}
+			}
+			assert.True(t, found)
+
+			cancel()
+			require.NoError(t, <-runErr)
+		})
+	}
+}
+
+// TestNewInstallsANoOpObserver asserts a pool built without one still runs,
+// rather than dereferencing nil on the first job.
+func TestNewInstallsANoOpObserver(t *testing.T) {
+	t.Parallel()
+
+	pool := New(nil, nil)
+	require.NotNil(t, pool.observer)
+	assert.NotPanics(t, func() { pool.observer.JobFinished(StatusProcessed, time.Second) })
+}

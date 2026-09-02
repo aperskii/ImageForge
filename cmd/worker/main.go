@@ -29,6 +29,8 @@ import (
 	"imageforge/internal/adapters/imageproc"
 	"imageforge/internal/adapters/memqueue"
 	"imageforge/internal/domain"
+	"imageforge/internal/metrics"
+	"imageforge/internal/ports"
 	"imageforge/internal/usecase"
 	"imageforge/internal/worker"
 )
@@ -68,19 +70,37 @@ func run(args []string) error {
 	}
 	defer imageproc.Shutdown()
 
+	recorder := metrics.New()
 	pool := worker.New(
 		set.Queue,
 		usecase.NewProcessJob(set.Storage, set.Jobs, processor),
 		worker.WithSize(cfg.poolSize),
 		worker.WithLogger(logger),
+		worker.WithObserver(recorder),
 		worker.WithShutdownTimeout(cfg.shutdownTimeout),
 		worker.WithJobTimeout(cfg.jobTimeout),
 	)
+
+	// The metrics endpoint is on its own listener: it is for the operator, and
+	// putting it on an application port makes it hard to firewall off.
+	metricsServer := metrics.NewServer(cfg.metricsAddr, recorder, logger)
+	metricsErr := make(chan error, 1)
+	go func() { metricsErr <- metricsServer.ListenAndServe() }()
+
+	// The depth gauge is best-effort: queues that cannot report it simply
+	// leave it unset.
+	if reporter, ok := set.Queue.(ports.DepthReporter); ok {
+		go recorder.PollDepth(ctx, logger, reporter.Depth, cfg.depthInterval)
+	} else {
+		logger.Debug("the queue cannot report its depth, so the gauge stays unset",
+			slog.String("backend", set.Name))
+	}
 
 	logger.Info("worker starting",
 		slog.String("backend", set.Name),
 		slog.String("image_backend", imageproc.Backend),
 		slog.String("adapters", set.Description),
+		slog.String("metrics_addr", metricsServer.Addr()),
 		slog.Int("workers", cfg.poolSize))
 
 	// Seeding happens before the pool starts so the jobs are already queued;
@@ -98,9 +118,23 @@ func run(args []string) error {
 			slog.String("hint", "pass image paths, or set IMAGEFORGE_BACKEND=aws to share a queue"))
 	}
 
-	// Run blocks until a signal arrives, then drains what is in flight.
-	if err = pool.Run(ctx); err != nil {
-		return fmt.Errorf("pool: %w", err)
+	// Run blocks until a signal arrives, then stops polling and drains what is
+	// already in flight.
+	runErr := pool.Run(ctx)
+
+	// The metrics server outlives the pool deliberately, so a final scrape can
+	// still collect the counters for the jobs that just drained.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), metricsShutdownTimeout)
+	defer cancel()
+	if err = metricsServer.Shutdown(shutdownCtx); err != nil {
+		logger.Warn("the metrics server did not stop cleanly", slog.String("error", err.Error()))
+	}
+	if err = <-metricsErr; err != nil {
+		logger.Warn("the metrics server failed", slog.String("error", err.Error()))
+	}
+
+	if runErr != nil {
+		return fmt.Errorf("pool: %w", runErr)
 	}
 
 	logger.Info("worker stopped cleanly", slog.Any("stats", pool.Stats()))
@@ -135,9 +169,14 @@ func seed(
 	return nil
 }
 
+// metricsShutdownTimeout bounds the wait for in-flight scrapes to finish.
+const metricsShutdownTimeout = 5 * time.Second
+
 // config holds the runtime settings, all overridable by environment variable.
 type config struct {
 	backend         string
+	metricsAddr     string
+	depthInterval   time.Duration
 	storageDir      string
 	watermarkText   string
 	poolSize        int
@@ -153,6 +192,8 @@ type config struct {
 func loadConfig() config {
 	return config{
 		backend:         adapters.BackendFromEnv(),
+		metricsAddr:     envString("IMAGEFORGE_METRICS_ADDR", ":9090"),
+		depthInterval:   envDuration("IMAGEFORGE_QUEUE_DEPTH_INTERVAL", metrics.DefaultDepthInterval),
 		storageDir:      envString("IMAGEFORGE_STORAGE_DIR", ".data/storage"),
 		watermarkText:   envString("IMAGEFORGE_WATERMARK_TEXT", imageproc.DefaultWatermarkText),
 		poolSize:        int(envInt64("IMAGEFORGE_WORKERS", worker.DefaultSize)),
