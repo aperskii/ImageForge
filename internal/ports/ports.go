@@ -29,6 +29,23 @@ type Queue interface {
 	Consume(ctx context.Context) (<-chan string, error)
 }
 
+// Acknowledger is an optional companion to Queue, implemented by queues whose
+// deliveries must be settled explicitly.
+//
+// A queue that redelivers unsettled messages — SQS, and any other at-least-once
+// broker — implements this so a consumer can say whether it finished with a
+// job. Queues that hand out a job exactly once, such as an in-memory channel,
+// do not, and consumers must treat the interface as optional: assert for it and
+// carry on without it when it is absent.
+type Acknowledger interface {
+	// Ack settles the delivery of jobID successfully, removing it from the
+	// queue so it is not delivered again.
+	Ack(ctx context.Context, jobID string) error
+	// Nack abandons the delivery of jobID, returning it to the queue for
+	// redelivery.
+	Nack(ctx context.Context, jobID string) error
+}
+
 // JobRepository persists job state.
 type JobRepository interface {
 	// Save stores job, creating it or replacing it wholesale.

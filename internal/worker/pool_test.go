@@ -529,3 +529,128 @@ type failingProcessor struct{}
 func (*failingProcessor) Process(context.Context, io.Reader, domain.TransformationSpec) (io.Reader, error) {
 	return nil, fmt.Errorf("processor is broken")
 }
+
+// ackingQueue wraps a queue with the optional ports.Acknowledger interface and
+// records how each delivery was settled.
+type ackingQueue struct {
+	*memqueue.Queue
+
+	mu     sync.Mutex
+	acked  []string
+	nacked []string
+}
+
+func (q *ackingQueue) Ack(_ context.Context, jobID string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.acked = append(q.acked, jobID)
+	return nil
+}
+
+func (q *ackingQueue) Nack(_ context.Context, jobID string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.nacked = append(q.nacked, jobID)
+	return nil
+}
+
+func (q *ackingQueue) settled() (acked, nacked []string) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return append([]string(nil), q.acked...), append([]string(nil), q.nacked...)
+}
+
+// TestPoolSettlesDeliveries covers the optional ports.Acknowledger path: a
+// finished job is acknowledged so an at-least-once queue deletes it, and a
+// failed one is returned for redelivery.
+func TestPoolSettlesDeliveries(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		processor  ports.ImageProcessor
+		wantAcked  int
+		wantNacked int
+	}{
+		{name: "a processed job is acknowledged", processor: nil, wantAcked: 1},
+		{name: "a failed job is returned to the queue", processor: &failingProcessor{}, wantNacked: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			storage, err := localstorage.New(t.TempDir())
+			require.NoError(t, err)
+			queue := &ackingQueue{Queue: memqueue.New(4)}
+			t.Cleanup(queue.Close)
+			jobs := memrepo.New()
+
+			processor := tt.processor
+			if processor == nil {
+				processor, err = imageproc.New()
+				require.NoError(t, err)
+			}
+
+			createJob := usecase.NewCreateJob(storage, jobs, queue)
+			pool := New(queue, usecase.NewProcessJob(storage, jobs, processor),
+				WithSize(1), WithLogger(discardLogger()))
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			job, err := createJob.Execute(ctx, usecase.CreateJobInput{
+				Source: bytes.NewReader(samplePNG(t, 32, 32)),
+				Spec:   domain.TransformationSpec{Width: 16, Format: domain.FormatPNG},
+			})
+			require.NoError(t, err)
+
+			runErr := make(chan error, 1)
+			go func() { runErr <- pool.Run(ctx) }()
+
+			require.Eventually(t, func() bool {
+				acked, nacked := queue.settled()
+				return len(acked) == tt.wantAcked && len(nacked) == tt.wantNacked
+			}, 30*time.Second, 10*time.Millisecond)
+
+			acked, nacked := queue.settled()
+			if tt.wantAcked > 0 {
+				assert.Equal(t, []string{job.ID}, acked)
+			}
+			if tt.wantNacked > 0 {
+				assert.Equal(t, []string{job.ID}, nacked)
+			}
+
+			cancel()
+			require.NoError(t, <-runErr)
+		})
+	}
+}
+
+// TestPoolWithoutAcknowledgerIsFine asserts a queue that does not implement the
+// optional interface is simply left alone.
+func TestPoolWithoutAcknowledgerIsFine(t *testing.T) {
+	t.Parallel()
+
+	stack := newStack(t, 4, WithSize(1))
+	require.NotImplements(t, (*ports.Acknowledger)(nil), stack.queue)
+
+	_, err := stack.createJob.Execute(context.Background(), usecase.CreateJobInput{
+		Source: bytes.NewReader(samplePNG(t, 32, 32)),
+		Spec:   domain.TransformationSpec{Width: 16, Format: domain.FormatPNG},
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- stack.pool.Run(ctx) }()
+
+	require.Eventually(t, func() bool {
+		return stack.pool.Stats().Processed == 1
+	}, 30*time.Second, 10*time.Millisecond)
+
+	cancel()
+	require.NoError(t, <-runErr)
+}

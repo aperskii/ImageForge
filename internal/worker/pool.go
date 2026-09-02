@@ -34,6 +34,9 @@ const (
 	// DefaultJobTimeout bounds a single job. Image work is CPU-bound and
 	// finite; a job that exceeds this is stuck rather than slow.
 	DefaultJobTimeout = 2 * time.Minute
+	// settleTimeout bounds the call that acknowledges a delivery, so a wedged
+	// broker cannot hold a worker after its job is done.
+	settleTimeout = 10 * time.Second
 )
 
 // Stats counts the outcomes a pool has seen since it started.
@@ -240,6 +243,9 @@ func (p *Pool) handle(ctx context.Context, workerID int, jobID string) {
 			slog.Int("worker", workerID),
 			slog.String("job_id", jobID),
 			slog.String("reason", err.Error()))
+		// A duplicate delivery is settled, not retried: redelivering it would
+		// only produce the same skip.
+		p.settle(ctx, workerID, jobID, true)
 	case err != nil:
 		p.failed.Add(1)
 		p.logger.ErrorContext(ctx, "job failed",
@@ -247,6 +253,7 @@ func (p *Pool) handle(ctx context.Context, workerID int, jobID string) {
 			slog.String("job_id", jobID),
 			slog.Duration("duration", elapsed),
 			slog.String("error", err.Error()))
+		p.settle(ctx, workerID, jobID, false)
 	default:
 		p.processed.Add(1)
 		p.logger.InfoContext(ctx, "job processed",
@@ -254,5 +261,40 @@ func (p *Pool) handle(ctx context.Context, workerID int, jobID string) {
 			slog.String("job_id", jobID),
 			slog.String("result_key", job.ResultKey),
 			slog.Duration("duration", elapsed))
+		p.settle(ctx, workerID, jobID, true)
 	}
+}
+
+// settle tells an acknowledging queue what became of a delivery.
+//
+// Queues that hand out a job exactly once do not implement ports.Acknowledger,
+// and for them this is a no-op. Settling uses a context detached from the job's
+// own: a job that failed because its context expired must still be able to
+// return its message to the queue.
+func (p *Pool) settle(ctx context.Context, workerID int, jobID string, done bool) {
+	acker, ok := p.queue.(ports.Acknowledger)
+	if !ok {
+		return
+	}
+
+	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), settleTimeout)
+	defer cancel()
+
+	var err error
+	if done {
+		err = acker.Ack(settleCtx, jobID)
+	} else {
+		err = acker.Nack(settleCtx, jobID)
+	}
+	if err == nil {
+		return
+	}
+
+	// A delivery that cannot be settled reappears when its visibility timeout
+	// expires, so this costs a repeat, not the job.
+	p.logger.ErrorContext(settleCtx, "settling the delivery failed",
+		slog.Int("worker", workerID),
+		slog.String("job_id", jobID),
+		slog.Bool("acknowledged", done),
+		slog.String("error", err.Error()))
 }
