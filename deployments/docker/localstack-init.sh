@@ -10,7 +10,10 @@
 # and credentials taken from the environment.
 set -eu
 
-REGION="${AWS_REGION:-eu-west-1}"
+# IMAGEFORGE_AWS_REGION takes precedence because LocalStack overrides AWS_REGION
+# in its own init stage, which would otherwise create the resources in a region
+# the application does not look in.
+REGION="${IMAGEFORGE_AWS_REGION:-${AWS_REGION:-${AWS_DEFAULT_REGION:-eu-west-1}}}"
 ENDPOINT="${AWS_ENDPOINT_URL:-http://localhost:4566}"
 BUCKET="${IMAGEFORGE_S3_BUCKET:-imageforge-media}"
 QUEUE="${IMAGEFORGE_SQS_QUEUE:-imageforge-jobs}"
@@ -23,7 +26,10 @@ TABLE="${IMAGEFORGE_DYNAMODB_TABLE:-imageforge-jobs}"
 MAX_RECEIVE_COUNT="${IMAGEFORGE_SQS_MAX_RECEIVE:-5}"
 
 if command -v awslocal >/dev/null 2>&1; then
-	aws_cli() { awslocal "$@"; }
+	# The region is pinned on every call: LocalStack's own init stage exports a
+	# different AWS_REGION than the container, and a bucket's location
+	# constraint must match the endpoint the request goes to.
+	aws_cli() { awslocal --region "$REGION" "$@"; }
 else
 	# LocalStack accepts any credentials, but the CLI refuses to sign without.
 	export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-test}"

@@ -80,12 +80,15 @@ linters:
         - name: var-naming
 
     gocritic:
+      disabled-checks:
+        # Fires on idiomatic value receivers and on aws.Config, which the AWS
+        # SDK itself passes by value. Copying a mid-size struct is not the
+        # bottleneck in code that then makes a network call.
+        - hugeParam
       enabled-tags:
         - diagnostic
         - performance
         - style
-      disabled-checks:
-        - whyNoLint
 
     goconst:
       min-len: 3

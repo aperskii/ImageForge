@@ -10,7 +10,7 @@ BIN_DIR        ?= bin
 
 .DEFAULT_GOAL := build
 
-.PHONY: build test lint run-api run-worker dev
+.PHONY: build test lint run-api run-worker dev aws-init aws-up test-integration
 
 ## build: compile the api and worker binaries into $(BIN_DIR)
 build:
@@ -35,3 +35,18 @@ run-worker:
 ## dev: start the local development stack (LocalStack)
 dev:
 	$(DOCKER_COMPOSE) up
+
+## aws-init: create the LocalStack resources (bucket, queue, DLQ, table)
+aws-init:
+	$(DOCKER_COMPOSE) exec -T localstack sh /etc/localstack/init/ready.d/localstack-init.sh
+
+## aws-up: start LocalStack and wait until its resources exist
+aws-up:
+	$(DOCKER_COMPOSE) up -d localstack
+	@echo "waiting for localstack..."
+	@until $(DOCKER_COMPOSE) exec -T localstack curl -sf http://localhost:4566/_localstack/health >/dev/null 2>&1; do sleep 1; done
+	@$(MAKE) aws-init
+
+## test-integration: run the integration suite against a running LocalStack
+test-integration:
+	$(GO) test -tags integration -count=1 -timeout 10m ./test/integration/...

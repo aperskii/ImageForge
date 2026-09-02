@@ -8,10 +8,14 @@ services:
       SERVICES: s3,sqs,dynamodb
       DEBUG: "0"
       AWS_DEFAULT_REGION: eu-west-1
+      AWS_REGION: eu-west-1
+      IMAGEFORGE_AWS_REGION: eu-west-1
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
       PERSISTENCE: "0"
     volumes:
+      # LocalStack runs every script here once the services are up.
+      - ./deployments/docker/localstack-init.sh:/etc/localstack/init/ready.d/localstack-init.sh:ro
       - localstack-data:/var/lib/localstack
       - /var/run/docker.sock:/var/run/docker.sock
     healthcheck:
