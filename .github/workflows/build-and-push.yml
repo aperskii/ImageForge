@@ -1,0 +1,130 @@
+# Builds both images and pushes them to ECR when something lands on the default
+# branch.
+#
+# Authentication is OIDC: GitHub mints a short-lived token for this run, AWS
+# trades it for temporary credentials, and nothing long-lived is ever stored.
+# A leaked access key in a repository secret is one of the more common ways an
+# AWS account is lost, and this removes the key entirely.
+#
+# It needs two repository variables and no secrets:
+#   AWS_ROLE_ARN  the role to assume, from the github-oidc Terraform module
+#   AWS_REGION    where the ECR repositories live
+name: Build and push
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build
+        required: false
+        type: string
+
+# Two pushes in quick succession should not race each other to tag :latest.
+# This one does not cancel: a half-finished push is worse than a slow one.
+concurrency:
+  group: build-and-push-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  # Required to request the OIDC token. Without it the role assumption fails
+  # with a message that does not obviously say so.
+  id-token: write
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.service }}
+    runs-on: ubuntu-latest
+
+    # Skipped entirely when no role is configured, so a fork or a fresh clone
+    # gets a clear skip rather than a confusing credentials error.
+    if: vars.AWS_ROLE_ARN != ''
+
+    strategy:
+      # Push both or neither: a half-deployed pair is worse than no deploy.
+      fail-fast: false
+      matrix:
+        service: [api, worker]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-build-${{ github.run_id }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Work out the tags
+        id: meta
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPOSITORY: ${{ vars.ECR_NAMESPACE || 'imageforge-dev' }}/${{ matrix.service }}
+        run: |
+          image="$REGISTRY/$REPOSITORY"
+          # The commit sha is the tag that means something: it is unique, it is
+          # traceable back to a commit, and it never moves. :latest is a
+          # convenience for the dev environment on top of it.
+          {
+            echo "tags=$image:${{ github.sha }},$image:latest"
+            echo "image=$image"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deployments/docker/${{ matrix.service }}.Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            VERSION=${{ github.sha }}
+          # The layer cache lives in the registry, so a build on a fresh runner
+          # still reuses the dependency layers from the last one. The worker
+          # image installs libvips, which is not quick.
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,scope=${{ matrix.service }},mode=max
+          provenance: false
+
+      - name: Summarise
+        run: |
+          {
+            echo "### Pushed \`${{ matrix.service }}\`"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.image }}:${{ github.sha }}"
+            echo "${{ steps.meta.outputs.image }}:latest"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Rolling the services onto the new images is deliberately a separate,
+  # manual step rather than something a merge does on its own. The services
+  # ignore_changes on their task definition for the same reason.
+  deploy-hint:
+    name: How to deploy
+    runs-on: ubuntu-latest
+    needs: build
+    if: success()
+    steps:
+      - name: Print the command
+        run: |
+          {
+            echo "### Images are in ECR"
+            echo
+            echo "They are not running yet. To roll the dev services onto them:"
+            echo
+            echo '```sh'
+            echo 'eval "$(terraform -chdir=deployments/terraform/environments/dev output -raw deploy_command)"'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

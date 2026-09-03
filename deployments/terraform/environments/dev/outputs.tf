@@ -68,3 +68,14 @@ output "aws_region" {
   description = "Region everything was created in."
   value       = var.aws_region
 }
+
+output "github_actions_variables" {
+  description = <<-EOT
+    Repository variables to set under Settings, Secrets and variables, Actions.
+    Empty when no GitHub repository is configured.
+  EOT
+  value = length(module.github_oidc) == 0 ? {} : merge(
+    module.github_oidc[0].github_variables,
+    { AWS_REGION = var.aws_region, ECR_NAMESPACE = local.name_prefix },
+  )
+}

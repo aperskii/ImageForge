@@ -76,7 +76,7 @@ func TestTransformationSpecValidate(t *testing.T) {
 			wantErr: []error{ErrInvalidFormat},
 		},
 		{
-			name:    "uppercase format is not normalised",
+			name:    "uppercase format is not normalized",
 			spec:    TransformationSpec{Width: 800, Format: Format("JPEG"), Quality: 85},
 			wantErr: []error{ErrInvalidFormat},
 		},

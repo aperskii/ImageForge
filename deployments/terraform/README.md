@@ -13,6 +13,7 @@ deployments/terraform/
     network/     VPC, subnets, and optionally a NAT gateway
     cloudfront/  distribution over the results, with an origin access control
     ecs/         cluster, load balancer, task definitions, services, IAM
+    github-oidc/ roles GitHub Actions assumes, with no stored keys
   environments/
     dev/         wires the modules together for one environment
 ```
@@ -45,7 +46,7 @@ terraform destroy
 
 The dev environment sets `force_destroy` on its buckets and ECR repositories, so
 `destroy` works without emptying them by hand first. That is deliberately not
-the default in the modules, because it is the wrong behaviour anywhere else.
+the default in the modules, because it is the wrong behavior anywhere else.
 
 ### State
 

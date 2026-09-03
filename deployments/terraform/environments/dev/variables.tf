@@ -157,3 +157,28 @@ variable "cloudfront_price_class" {
   type        = string
   default     = "PriceClass_100"
 }
+
+# ------------------------------------------------------- github actions -----
+variable "github_owner" {
+  description = "GitHub user or organization that owns the repository."
+  type        = string
+  default     = ""
+}
+
+variable "github_repository" {
+  description = <<-EOT
+    Repository name, without the owner. Leave empty to skip creating the
+    GitHub Actions roles entirely.
+  EOT
+  type        = string
+  default     = ""
+}
+
+variable "create_github_oidc_provider" {
+  description = <<-EOT
+    Whether to create the GitHub OIDC provider. It is account-wide, so set this
+    false if the account already has one.
+  EOT
+  type        = bool
+  default     = true
+}

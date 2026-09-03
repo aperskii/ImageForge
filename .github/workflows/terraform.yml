@@ -1,0 +1,262 @@
+# Terraform checks on pull requests, and a deliberately manual apply.
+#
+# fmt and validate need no AWS credentials and always run. plan needs to read
+# real state, so it assumes a read-only role over OIDC and is skipped when none
+# is configured. apply is workflow_dispatch only: infrastructure should not
+# change because someone merged a pull request.
+name: Terraform
+
+on:
+  pull_request:
+    paths:
+      - "deployments/terraform/**"
+      - ".github/workflows/terraform.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to act on
+        required: true
+        default: dev
+        type: choice
+        options: [dev]
+      action:
+        description: What to do
+        required: true
+        default: plan
+        type: choice
+        options: [plan, apply]
+
+concurrency:
+  # Never run two applies against one environment at once: with local state
+  # that corrupts it, and with remote state it just fails slowly.
+  group: terraform-${{ inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: "1.15.8"
+  # Terraform's own colour codes make a PR comment unreadable.
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  # ---------------------------------------------------------------- checks --
+  # No credentials, so this runs on every pull request including from a fork.
+  validate:
+    name: fmt and validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive -diff
+        working-directory: deployments/terraform
+
+      # Each module is validated on its own as well as through the environment,
+      # so a module that nothing happens to call yet cannot rot.
+      - name: Validate each module
+        working-directory: deployments/terraform
+        run: |
+          failed=0
+          for dir in modules/*/; do
+            name=$(basename "$dir")
+            printf '==> %s\n' "$name"
+            if ! (cd "$dir" && terraform init -backend=false >/dev/null && terraform validate); then
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+      - name: Validate the dev environment
+        working-directory: deployments/terraform/environments/dev
+        run: |
+          terraform init -backend=false
+          terraform validate
+
+  # ------------------------------------------------------------------ plan --
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    needs: validate
+    if: >-
+      vars.AWS_PLAN_ROLE_ARN != '' &&
+      (github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository)
+
+    permissions:
+      contents: read
+      id-token: write
+      # To post the plan back onto the pull request.
+      pull-requests: write
+
+    defaults:
+      run:
+        working-directory: deployments/terraform/environments/${{ inputs.environment || 'dev' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # A plan reads state and describes resources, so the role behind this
+      # should be read-only. Nothing here needs write access to anything.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-tf-plan-${{ github.run_id }}
+
+      - name: Init
+        run: terraform init
+
+      - name: Plan
+        id: plan
+        # A plan that finds a problem should still be reported on the pull
+        # request rather than failing the job before the comment is written.
+        continue-on-error: true
+        run: |
+          terraform plan -no-color -lock-timeout=5m -out=tfplan | tee plan.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the plan
+        if: steps.plan.outputs.exitcode == '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment || 'dev' }}-${{ github.sha }}
+          path: deployments/terraform/environments/${{ inputs.environment || 'dev' }}/tfplan
+          retention-days: 5
+
+      - name: Comment on the pull request
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          PLAN_EXIT: ${{ steps.plan.outputs.exitcode }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'deployments/terraform/environments/dev/plan.txt';
+
+            let plan = fs.existsSync(path) ? fs.readFileSync(path, 'utf8') : '(no plan output)';
+
+            // A GitHub comment caps at 65536 characters. Keep the tail, which
+            // is where the summary line lives, rather than the head.
+            const limit = 60000;
+            let truncated = false;
+            if (plan.length > limit) {
+              plan = plan.slice(plan.length - limit);
+              truncated = true;
+            }
+
+            const failed = process.env.PLAN_EXIT !== '0';
+            const marker = '<!-- imageforge-terraform-plan -->';
+            const body = [
+              marker,
+              `### Terraform plan — ${failed ? 'failed' : 'succeeded'}`,
+              '',
+              truncated ? '> Truncated to the last 60000 characters.\n' : '',
+              '<details><summary>Show plan</summary>',
+              '',
+              '```terraform',
+              plan,
+              '```',
+              '',
+              '</details>',
+              '',
+              `Ran against \`dev\` for ${context.sha.slice(0, 7)}. Applying is a separate, manual step.`,
+            ].join('\n');
+
+            // Update the existing comment rather than adding one per push, so
+            // a long-lived pull request does not accumulate a dozen plans.
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Fail if the plan failed
+        if: steps.plan.outputs.exitcode != '0'
+        run: |
+          echo "terraform plan exited ${{ steps.plan.outputs.exitcode }}"
+          exit 1
+
+  # ----------------------------------------------------------------- apply --
+  # Only ever reachable by hand. The environment below is where an approval
+  # requirement is configured in repository settings, which is what turns this
+  # from "anyone who can dispatch" into "someone signed off".
+  apply:
+    name: apply
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'apply'
+    needs: plan
+
+    environment:
+      name: ${{ inputs.environment }}
+
+    permissions:
+      contents: read
+      id-token: write
+
+    defaults:
+      run:
+        working-directory: deployments/terraform/environments/${{ inputs.environment }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-tf-apply-${{ github.run_id }}
+
+      - name: Init
+        run: terraform init
+
+      # Planning again rather than applying the artefact from the plan job:
+      # this run may be minutes or days later, and applying a stale plan is how
+      # infrastructure gets changed by something nobody looked at.
+      - name: Apply
+        run: terraform apply -auto-approve -lock-timeout=5m
+
+      - name: Summarise the outputs
+        run: |
+          {
+            echo "### Applied to ${{ inputs.environment }}"
+            echo
+            echo '```'
+            terraform output || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

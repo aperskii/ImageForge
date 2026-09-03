@@ -322,7 +322,7 @@ resource "aws_ecs_service" "api" {
 
   deployment_circuit_breaker {
     enable = true
-    # A deploy whose tasks will not stabilise rolls back rather than leaving
+    # A deploy whose tasks will not stabilize rolls back rather than leaving
     # the service half-replaced.
     rollback = true
   }

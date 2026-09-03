@@ -1,5 +1,8 @@
 # ImageForge
 
+[![CI](https://github.com/aperskii/ImageForge/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/aperskii/ImageForge/actions/workflows/ci.yml)
+[![Build and push](https://github.com/aperskii/ImageForge/actions/workflows/build-and-push.yml/badge.svg?branch=master)](https://github.com/aperskii/ImageForge/actions/workflows/build-and-push.yml)
+[![Terraform](https://github.com/aperskii/ImageForge/actions/workflows/terraform.yml/badge.svg)](https://github.com/aperskii/ImageForge/actions/workflows/terraform.yml)
 ![Status](https://img.shields.io/badge/status-work%20in%20progress-yellow)
 
 ImageForge is a cloud-native image processing platform. Clients upload an image
@@ -391,6 +394,52 @@ make aws-up
 make test-integration
 ```
 
+
+## Continuous integration
+
+Three workflows, in `.github/workflows/`.
+
+| Workflow | Trigger | What it does |
+| --- | --- | --- |
+| `ci.yml` | every pull request | lint, `go test -race` on both backends, the integration suite against LocalStack, and the front-end build |
+| `build-and-push.yml` | merge to the default branch | builds both images and pushes them to ECR |
+| `terraform.yml` | pull requests touching `deployments/terraform`, plus manual dispatch | `fmt`, `validate`, `plan` as a PR comment; `apply` only by hand |
+
+`ci.yml` runs the Go suite twice, once with libvips and once with `-tags
+nogovips` in a job that deliberately does not install it. The fallback backend
+exists for environments without libvips, so it is tested in one.
+
+**Nothing stores an AWS key.** Both AWS-touching workflows authenticate over
+OIDC: GitHub mints a short-lived token for the run and AWS trades it for
+temporary credentials. `deployments/terraform/modules/github-oidc` creates the
+three roles, each trusting a different subject:
+
+| Role | Trusted subject | Power |
+| --- | --- | --- |
+| push | `ref:refs/heads/<default branch>` | write to these ECR repositories |
+| plan | `pull_request` and the default branch | read-only |
+| apply | `environment:dev` | change infrastructure |
+
+The apply role trusts a GitHub *environment* rather than a branch, which is what
+makes an approval rule on that environment load-bearing: without the approval,
+GitHub never mints a token with that subject, so the role cannot be assumed at
+all. Applying infrastructure is never something a merge does on its own.
+
+### Setting it up
+
+Apply the Terraform with your repository named, then copy the outputs into
+repository variables under **Settings → Secrets and variables → Actions**:
+
+```sh
+terraform -chdir=deployments/terraform/environments/dev apply \
+  -var github_owner=aperskii -var github_repository=ImageForge
+
+terraform -chdir=deployments/terraform/environments/dev \
+  output -json github_actions_variables
+```
+
+The workflows skip themselves when those variables are absent, so a fork or a
+fresh clone gets a clean skip rather than a confusing credentials error.
 ## Container images
 
 Two images, built by `deployments/docker/*.Dockerfile` from the repository root.

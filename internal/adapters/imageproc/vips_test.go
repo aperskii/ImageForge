@@ -96,7 +96,7 @@ func TestProcessToWebP(t *testing.T) {
 	assert.Equal(t, 24, cfg.Height)
 }
 
-// TestWatermarkScalesWithTheImage covers the govips-only behaviour: the label
+// TestWatermarkScalesWithTheImage covers the govips-only behavior: the label
 // is sized relative to the image, so even a small one can carry the text.
 func TestWatermarkScalesWithTheImage(t *testing.T) {
 	t.Parallel()

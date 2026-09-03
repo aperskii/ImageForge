@@ -27,13 +27,13 @@ var (
 
 // Processor transforms images with libvips, through govips.
 //
-// A Processor is safe for concurrent use: libvips is initialised once per
+// A Processor is safe for concurrent use: libvips is initialized once per
 // process and each operation works on its own image handle.
 type Processor struct {
 	cfg config
 }
 
-// New initialises libvips if it is not already running and returns a Processor.
+// New initializes libvips if it is not already running and returns a Processor.
 //
 // libvips is a process-wide resource, so the first call performs the startup
 // and later calls reuse it. Call Shutdown once, at process exit.

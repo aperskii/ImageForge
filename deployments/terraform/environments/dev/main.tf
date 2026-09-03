@@ -150,3 +150,24 @@ module "ecs" {
 
   tags = local.tags
 }
+
+# Roles GitHub Actions assumes. Created only when a repository is named, so an
+# environment that is applied by hand does not grow three unused roles.
+module "github_oidc" {
+  source = "../../modules/github-oidc"
+  count  = var.github_repository == "" ? 0 : 1
+
+  name_prefix       = local.name_prefix
+  github_owner      = var.github_owner
+  github_repository = var.github_repository
+
+  ecr_repository_arns = values(module.ecr.repository_arns)
+
+  # The OIDC provider is account-wide; set this false if the account already
+  # has one from another project.
+  create_oidc_provider = var.create_github_oidc_provider
+
+  apply_environments = [var.environment]
+
+  tags = local.tags
+}

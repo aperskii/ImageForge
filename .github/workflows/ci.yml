@@ -1,0 +1,205 @@
+# Runs on every pull request, and on the default branch so its badge reflects
+# the state of what is shipped rather than of the last PR.
+name: CI
+
+on:
+  pull_request:
+  push:
+    # The repository's default branch is master; main is listed too so a rename
+    # does not silently stop CI from running.
+    branches: [main, master]
+
+# A new push to a branch makes the previous run's answer irrelevant, so cancel
+# it rather than paying for both. Never cancel on the default branch: that run
+# is what the badge reports.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Nothing here writes anything. The default token is read-only for good measure.
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.24"
+  NODE_VERSION: "24"
+  GOLANGCI_LINT_VERSION: v2.13.2
+
+jobs:
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # The linter type-checks the whole module, and the default build binds
+      # libvips through cgo, so the headers have to be here before it runs.
+      - name: Install libvips
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libvips-dev
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+
+      # The pure-Go backend is a separate build configuration, so the linter
+      # never sees it in the run above. Without this it can rot unnoticed.
+      - name: Lint the pure-Go backend
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          args: --build-tags nogovips
+
+  test:
+    name: go test (libvips)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install libvips
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libvips-dev
+
+      - name: Vet
+        run: go vet ./...
+
+      # -race needs cgo, which this configuration has anyway. It is the run
+      # that matters most: the worker pool is the concurrent part.
+      - name: Test with the race detector
+        run: go test -race -count=1 ./...
+
+  test-purego:
+    name: go test (pure Go)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Vet
+        run: go vet -tags nogovips ./...
+
+      # The fallback backend exists for environments without libvips, so it is
+      # tested in one: no libvips is installed in this job on purpose.
+      - name: Test the pure-Go backend
+        run: go test -race -tags nogovips -count=1 ./...
+
+  # The integration suite needs S3, SQS and DynamoDB. LocalStack provides all
+  # three as a service container, so the AWS adapters are exercised on every PR
+  # rather than only on a developer's machine.
+  integration:
+    name: integration (LocalStack)
+    runs-on: ubuntu-latest
+
+    services:
+      localstack:
+        image: localstack/localstack:3
+        ports:
+          - 4566:4566
+        env:
+          SERVICES: s3,sqs,dynamodb
+          AWS_DEFAULT_REGION: eu-west-1
+          IMAGEFORGE_AWS_REGION: eu-west-1
+        options: >-
+          --health-cmd "curl -sf http://localhost:4566/_localstack/health"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install libvips
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libvips-dev
+
+      # The service container has no bind mounts, so the resources are created
+      # by running the same script the compose stack uses, from the runner.
+      - name: Create the AWS resources
+        env:
+          AWS_ENDPOINT_URL: http://localhost:4566
+          IMAGEFORGE_AWS_REGION: eu-west-1
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+        run: sh deployments/docker/localstack-init.sh
+
+      - name: Run the integration suite
+        env:
+          AWS_ENDPOINT_URL: http://localhost:4566
+          AWS_REGION: eu-west-1
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+        run: go test -tags integration -count=1 -timeout 15m ./test/integration/
+
+  web:
+    name: web build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # ci rather than install: it installs exactly what the lockfile says and
+      # fails if package.json and the lockfile disagree, which is what a build
+      # should do.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+  # One job for branch protection to require, so adding a job above does not
+  # mean editing the protection rule.
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    needs: [lint, test, test-purego, integration, web]
+    if: always()
+    steps:
+      - name: Check that every job succeeded
+        run: |
+          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            echo "At least one job did not succeed."
+            exit 1
+          fi
+          echo "All jobs succeeded."
