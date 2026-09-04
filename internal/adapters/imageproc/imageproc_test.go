@@ -26,9 +26,6 @@ const (
 	gradientPNG = "gradient_64x48.png" // 64x48 landscape RGB gradient
 	checkerJPG  = "checker_48x64.jpg"  // 48x64 portrait checkerboard
 	alphaPNG    = "alpha_32x32.png"    // 32x32 square with a transparent border
-	// Carries a real EXIF block: GPS coordinates plus a distinctive Make,
-	// used as a canary by the metadata-stripping test.
-	exifGPSJPG = "exif_gps_48x64.jpg" // 48x64, with GPS EXIF
 )
 
 func TestMain(m *testing.M) {

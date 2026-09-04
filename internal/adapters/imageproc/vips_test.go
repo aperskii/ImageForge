@@ -19,6 +19,14 @@ import (
 	"imageforge/internal/domain"
 )
 
+// exifGPSJPG carries a real EXIF block: GPS coordinates plus a distinctive
+// Make, used as a canary by the metadata-stripping test below.
+//
+// It lives here rather than beside the other fixture names because only this
+// build uses it. Declared in the file they share, it is an unused constant
+// under -tags nogovips, which the linter reports and should.
+const exifGPSJPG = "exif_gps_48x64.jpg" // 48x64, with GPS EXIF
+
 func TestBackendIsGovips(t *testing.T) {
 	t.Parallel()
 	assert.Equal(t, "govips", Backend)
