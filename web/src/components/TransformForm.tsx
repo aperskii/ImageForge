@@ -201,7 +201,8 @@ export function TransformForm({ value, onChange, disabled = false }: TransformFo
           <span className="text-sm text-slate-700 dark:text-slate-300">
             Strip metadata
             <span className="block text-xs text-slate-500 dark:text-slate-400">
-              Removes EXIF, including any GPS location.
+              Removes the camera's EXIF, including any GPS location. The
+              encoder still writes orientation and resolution.
             </span>
           </span>
         </label>

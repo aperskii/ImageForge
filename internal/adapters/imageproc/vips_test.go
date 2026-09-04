@@ -146,3 +146,55 @@ func TestStripMetadata(t *testing.T) {
 	assert.Equal(t, 48, img.Width())
 	assert.Equal(t, 64, img.Height())
 }
+
+// TestStripMetadataRemovesTheCameraEXIF is the test behind a user-facing
+// privacy claim: the upload form offers to strip metadata "including any GPS
+// location", and nothing pinned that until now.
+//
+// The fixture carries a real EXIF block with GPS coordinates and a distinctive
+// Make. The test runs the same image through the pipeline twice, because
+// asserting only that the canary is absent would pass just as happily if the
+// pipeline never carried metadata in the first place. Metadata surviving the
+// unstripped run is what makes the stripped run mean something.
+func TestStripMetadataRemovesTheCameraEXIF(t *testing.T) {
+	t.Parallel()
+
+	// The Make field of testdata/exif_gps_48x64.jpg.
+	canary := []byte("IMAGEFORGE-GPS-CANARY")
+	source := readTestdata(t, exifGPSJPG)
+	require.Contains(t, string(source), string(canary),
+		"the fixture must carry the metadata this test is about")
+
+	processor := newProcessor(t)
+	run := func(t *testing.T, strip bool) []byte {
+		t.Helper()
+
+		out, err := processor.Process(t.Context(), bytes.NewReader(source),
+			domain.TransformationSpec{
+				Width:         24,
+				Format:        domain.FormatJPEG,
+				Quality:       80,
+				StripMetadata: strip,
+			})
+		require.NoError(t, err)
+
+		encoded, err := io.ReadAll(out)
+		require.NoError(t, err)
+		return encoded
+	}
+
+	kept := run(t, false)
+	require.Contains(t, string(kept), string(canary),
+		"without stripping, the pipeline carries the source metadata through -- "+
+			"if this fails the stripped assertion below proves nothing")
+
+	stripped := run(t, true)
+	assert.NotContains(t, string(stripped), string(canary),
+		"the camera's EXIF must not survive into the result")
+
+	// The result is still a usable image, not an empty one.
+	cfg, format, err := image.DecodeConfig(bytes.NewReader(stripped))
+	require.NoError(t, err)
+	assert.Equal(t, "jpeg", format)
+	assert.Equal(t, 24, cfg.Width)
+}

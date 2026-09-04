@@ -1,0 +1,22 @@
+# Copy to terraform.tfvars and edit. Doing so is optional: every value below
+# also has a default in variables.tf, so `terraform plan` works without this
+# file at all. It exists to put the knobs worth changing in one place.
+#
+# terraform.tfvars itself is gitignored, so anything environment-specific you
+# put there stays out of the repository.
+
+aws_region  = "eu-west-1"
+environment = "dev"
+
+# One of each. Scale the worker first: it is what does the actual work.
+api_desired_count    = 1
+worker_desired_count = 1
+
+# Dev keeps very little. All three are days.
+raw_expiration_days       = 7
+processed_expiration_days = 30
+log_retention_days        = 7
+
+# Narrow this to an office range if the environment should not be reachable
+# from the whole internet.
+api_ingress_cidrs = ["0.0.0.0/0"]

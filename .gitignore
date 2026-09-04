@@ -81,6 +81,12 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 
-# ---------- Terraform provider cache and state ----------
+# ---------- Terraform provider cache ----------
 **/.terraform/
-**/.terraform.lock.hcl
+
+# The lock file of a root module belongs in the repository: it pins provider
+# versions and their checksums, exactly as go.sum does, and a clone without it
+# can silently resolve different providers. The ones under modules/ are
+# artifacts of the per-module `terraform init -backend=false` that CI runs to
+# validate each module on its own -- those are not root modules anyone applies.
+deployments/terraform/modules/**/.terraform.lock.hcl

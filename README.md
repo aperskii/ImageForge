@@ -125,6 +125,16 @@ not change: `sqsqueue` grew an optional
 [`ports.Acknowledger`](internal/ports/ports.go) that the pool type-asserts for
 and works fine without.
 
+**Real AWS services, not a mock of them.** The `aws` backend runs on S3, SQS
+and DynamoDB through `aws-sdk-go-v2`, with the details those services actually
+force you to handle: SQS long polling, visibility timeouts, explicit
+delete-on-success, a redrive policy onto a dead-letter queue, S3 keys
+partitioned by prefix, and DynamoDB conditional updates that refuse to write a
+job that does not exist. LocalStack means the same code paths run locally and
+in CI — `test/integration` drives the whole upload → process → result flow
+against them on every pull request, so "the AWS adapters work" is a test result
+rather than an assertion.
+
 **Observability.** Structured `log/slog` throughout, Prometheus metrics on a
 separate port, and OpenTelemetry spans whose trace context rides the SQS message
 attributes — so one trace id follows a job from the browser's request into a
@@ -137,17 +147,26 @@ Fargate behind an ALB, CloudFront over an origin access control. The IAM is
 scoped to what the code does rather than to what the services are — the API has
 no `s3:GetObject`, because it never reads an object, and neither role can `Scan`.
 
+**CI/CD.** Three GitHub Actions workflows: every pull request is linted and
+tested with the race detector on *both* image backends plus the integration
+suite against a LocalStack service container and a front-end build; a merge
+builds both images and pushes them to ECR; Terraform plans post to the pull
+request and apply only on a manual dispatch behind an environment approval.
+Nothing stores an AWS key — all three authenticate over OIDC, with three roles
+trusting three different subjects.
+
 **Security in the transport, not around it.** Bearer tokens with a pinned
 signing algorithm, a per-client token bucket returning `429` with `Retry-After`,
 RFC 7807 problem responses, and media types decided by **sniffing the bytes**
 rather than believing the `Content-Type` header — a shell script called
 `photo.png` gets a `415`.
 
-**Operational detail.** Multi-stage builds producing a 23MB distroless API
-image; a healthcheck that runs the binary itself, because distroless has no
-curl; exponential backoff with full jitter, so workers that lost the queue
-together do not come back in lockstep; and CI that runs the suite twice, once
-with libvips and once in a job that deliberately does not install it.
+**Operational detail.** Multi-stage builds producing a distroless API image
+with no shell and no package manager; a healthcheck that runs the binary
+itself, because distroless has no curl; exponential backoff with full jitter,
+so workers that lost the queue together do not come back in lockstep; and CI
+that runs the suite twice, once with libvips and once in a job that
+deliberately does not install it.
 
 ## Quick start
 
@@ -607,8 +626,14 @@ They differ because the binaries differ.
 
 | Image | Base | cgo | Size |
 | --- | --- | --- | --- |
-| api | `distroless/static` | no | ~23MB |
-| worker | `debian:bookworm-slim` | yes | ~356MB |
+| api | `distroless/static` | no | ~44MB |
+| worker | `debian:bookworm-slim` | yes | ~374MB |
+
+Sizes are what `docker images` reports after `make images`. The API image was
+23MB before tracing was added: the OpenTelemetry SDK, the OTLP exporter and
+the gRPC and protobuf packages they pull in are most of the difference. That is
+a real cost of the observability above, and worth knowing before adding it to
+something smaller.
 
 `cmd/api` never reaches `internal/adapters/imageproc`, so it needs neither cgo
 nor libvips and ships as a single static binary on a base with no shell and no
@@ -739,3 +764,18 @@ into one of them (see the Terraform README); there is no TLS or domain on the
 load balancer; task counts are fixed rather than autoscaled on queue depth; and
 the front-end is a dev server in compose rather than a static build behind a
 CDN.
+
+## Development process
+
+I designed the architecture and the phased roadmap, and reviewed every change
+against them: the hexagonal layering and where its boundaries fall, the four
+ports and their optional companions, the choice of backends, the AWS topology
+and its IAM model, and the order the phases were built in.
+
+Claude Code was used as a pair-programming tool to accelerate the
+implementation of each phase. The design decisions, the trade-offs recorded
+throughout this README, and the review of what landed are mine.
+
+## License
+
+[MIT](LICENSE).
