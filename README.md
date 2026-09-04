@@ -254,6 +254,9 @@ mean processing time                                   121ms
 97% of jobs                                          < 250ms
 ```
 
+(4,687 rather than 4,686: one manual upload, used to check the tracing, shares
+the counter.)
+
 **What the numbers say.** Four workers at ~121ms a job is a ceiling of about 33
 jobs a second, and from ten clients upwards the API accepts uploads faster than
 that. The excess does not fail and does not slow the API down: it goes into the
