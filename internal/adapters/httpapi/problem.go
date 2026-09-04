@@ -6,6 +6,8 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5/middleware"
+
+	"imageforge/internal/telemetry"
 )
 
 // ProblemContentType is the media type RFC 7807 defines for these responses.
@@ -54,6 +56,10 @@ type Problem struct {
 	Instance string `json:"instance,omitempty"`
 	// RequestID ties the failure to the server log.
 	RequestID string `json:"request_id,omitempty"`
+	// TraceID ties it to the distributed trace, which reaches further than the
+	// request identifier does: it also covers the worker that picks the job up
+	// afterwards.
+	TraceID string `json:"trace_id,omitempty"`
 	// RetryAfter is the seconds to wait before retrying, when that is known.
 	RetryAfter int `json:"retry_after,omitempty"`
 }
@@ -74,6 +80,9 @@ func writeProblemWith(w http.ResponseWriter, r *http.Request, problem Problem) {
 	problem.Instance = r.URL.Path
 	if problem.RequestID == "" {
 		problem.RequestID = middleware.GetReqID(r.Context())
+	}
+	if problem.TraceID == "" {
+		problem.TraceID = telemetry.TraceID(r.Context())
 	}
 
 	body, err := json.Marshal(problem)

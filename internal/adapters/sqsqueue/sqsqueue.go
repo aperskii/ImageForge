@@ -21,14 +21,16 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 
 	"imageforge/internal/ports"
+	"imageforge/internal/telemetry"
 )
 
 // Compile-time assertions that Queue satisfies the port and its optional
 // companions.
 var (
-	_ ports.Queue         = (*Queue)(nil)
-	_ ports.Acknowledger  = (*Queue)(nil)
-	_ ports.DepthReporter = (*Queue)(nil)
+	_ ports.Queue            = (*Queue)(nil)
+	_ ports.Acknowledger     = (*Queue)(nil)
+	_ ports.DepthReporter    = (*Queue)(nil)
+	_ ports.DeliveryConsumer = (*Queue)(nil)
 )
 
 // API is the slice of the SQS client this adapter uses.
@@ -161,18 +163,64 @@ func New(ctx context.Context, client API, nameOrURL string, opts ...Option) (*Qu
 func (q *Queue) URL() string { return q.queueURL }
 
 // Enqueue publishes jobID for processing.
+//
+// The trace context in ctx, if any, travels with the message as attributes, so
+// the worker that eventually picks the job up continues the trace the upload
+// request started rather than beginning its own.
 func (q *Queue) Enqueue(ctx context.Context, jobID string) error {
 	if jobID == "" {
 		return errors.New("sqsqueue: empty job id")
 	}
 
 	if _, err := q.client.SendMessage(ctx, &sqs.SendMessageInput{
-		QueueUrl:    aws.String(q.queueURL),
-		MessageBody: aws.String(jobID),
+		QueueUrl:          aws.String(q.queueURL),
+		MessageBody:       aws.String(jobID),
+		MessageAttributes: encodeMeta(telemetry.Inject(ctx)),
 	}); err != nil {
 		return fmt.Errorf("sqsqueue: enqueue %s: %w", jobID, err)
 	}
 	return nil
+}
+
+// encodeMeta renders carrier as SQS message attributes, returning nil for an
+// empty carrier so an untraced message is sent without any.
+//
+// SQS allows ten attributes per message and counts them towards the 256KB
+// message size. Trace context is two short strings, so neither limit is in
+// reach.
+func encodeMeta(carrier telemetry.Carrier) map[string]types.MessageAttributeValue {
+	if len(carrier) == 0 {
+		return nil
+	}
+
+	attrs := make(map[string]types.MessageAttributeValue, len(carrier))
+	for key, value := range carrier {
+		attrs[key] = types.MessageAttributeValue{
+			DataType:    aws.String("String"),
+			StringValue: aws.String(value),
+		}
+	}
+	return attrs
+}
+
+// decodeMeta reads back what encodeMeta wrote, ignoring anything that is not a
+// string: a message with an attribute this service does not understand is
+// still a job worth doing.
+func decodeMeta(attrs map[string]types.MessageAttributeValue) map[string]string {
+	if len(attrs) == 0 {
+		return nil
+	}
+
+	meta := make(map[string]string, len(attrs))
+	for key, attr := range attrs {
+		if value := aws.ToString(attr.StringValue); value != "" {
+			meta[key] = value
+		}
+	}
+	if len(meta) == 0 {
+		return nil
+	}
+	return meta
 }
 
 // Consume long-polls the queue and returns a channel of job identifiers.
@@ -181,7 +229,33 @@ func (q *Queue) Enqueue(ctx context.Context, jobID string) error {
 // consumers for the visibility timeout and must be settled with Ack or Nack;
 // an unsettled delivery reappears once that timeout expires.
 func (q *Queue) Consume(ctx context.Context) (<-chan string, error) {
+	deliveries, err := q.ConsumeDeliveries(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	out := make(chan string)
+	go func() {
+		defer close(out)
+		for delivery := range deliveries {
+			select {
+			case out <- delivery.JobID:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return out, nil
+}
+
+// ConsumeDeliveries long-polls the queue and returns a channel of jobs, each
+// carrying the message attributes it arrived with.
+//
+// It behaves exactly as Consume in every other respect; Consume is written in
+// terms of it.
+func (q *Queue) ConsumeDeliveries(ctx context.Context) (<-chan ports.Delivery, error) {
+	out := make(chan ports.Delivery)
 
 	go func() {
 		defer close(out)
@@ -209,9 +283,9 @@ func (q *Queue) Consume(ctx context.Context) (<-chan string, error) {
 			}
 			retry.reset()
 
-			for _, jobID := range messages {
+			for _, delivery := range messages {
 				select {
-				case out <- jobID:
+				case out <- delivery:
 				case <-ctx.Done():
 					return
 				}
@@ -224,18 +298,21 @@ func (q *Queue) Consume(ctx context.Context) (<-chan string, error) {
 
 // receive performs one long poll and records the receipt handle of every
 // message it returns.
-func (q *Queue) receive(ctx context.Context) ([]string, error) {
+func (q *Queue) receive(ctx context.Context) ([]ports.Delivery, error) {
 	out, err := q.client.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 		QueueUrl:            aws.String(q.queueURL),
 		MaxNumberOfMessages: q.maxMessages,
 		WaitTimeSeconds:     int32(q.waitTime.Seconds()),
 		VisibilityTimeout:   int32(q.visibilityTimeout.Seconds()),
+		// Attributes are not returned unless they are asked for by name, and
+		// asking for them is what carries the trace context across the queue.
+		MessageAttributeNames: []string{"All"},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("sqsqueue: receive: %w", err)
 	}
 
-	jobIDs := make([]string, 0, len(out.Messages))
+	deliveries := make([]ports.Delivery, 0, len(out.Messages))
 	q.mu.Lock()
 	for _, msg := range out.Messages {
 		jobID := aws.ToString(msg.Body)
@@ -243,11 +320,14 @@ func (q *Queue) receive(ctx context.Context) ([]string, error) {
 			continue
 		}
 		q.receipts[jobID] = aws.ToString(msg.ReceiptHandle)
-		jobIDs = append(jobIDs, jobID)
+		deliveries = append(deliveries, ports.Delivery{
+			JobID: jobID,
+			Meta:  decodeMeta(msg.MessageAttributes),
+		})
 	}
 	q.mu.Unlock()
 
-	return jobIDs, nil
+	return deliveries, nil
 }
 
 // Ack deletes the message carrying jobID, so it is not delivered again.

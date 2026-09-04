@@ -115,17 +115,35 @@ func (a *API) Close() { a.limiter.Close() }
 // The stack is ordered so that every later layer, and any panic it raises, is
 // observed by the request log and reported with the request's identifier.
 func (a *API) Routes() http.Handler {
+	// Outermost, so every middleware below runs inside the server span and
+	// every line they log carries its trace id.
+	return withTracing(a.routes())
+}
+
+// routes builds the router itself, without the tracing wrapper.
+//
+// It is separate so that a test can mount a route of its own on the result and
+// still exercise the real middleware stack, which type-asserting the handler
+// Routes returns no longer allows.
+func (a *API) routes() chi.Router {
 	router := chi.NewRouter()
 
 	router.Use(middleware.RequestID)
 	router.Use(echoRequestID)
+	router.Use(traceRoute)
 	router.Use(requestLogger(a.cfg.Logger))
 	router.Use(recoverer(a.cfg.Logger))
 	router.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   a.cfg.AllowedOrigins,
-		AllowedMethods:   []string{http.MethodGet, http.MethodPost, http.MethodOptions},
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", middleware.RequestIDHeader},
-		ExposedHeaders:   []string{"Location", "Retry-After", middleware.RequestIDHeader},
+		AllowedOrigins: a.cfg.AllowedOrigins,
+		AllowedMethods: []string{http.MethodGet, http.MethodPost, http.MethodOptions},
+		AllowedHeaders: []string{
+			"Accept", "Authorization", "Content-Type",
+			middleware.RequestIDHeader,
+			// So a browser client that is itself traced can hand its trace to
+			// this service rather than starting a second one.
+			"traceparent", "tracestate",
+		},
+		ExposedHeaders:   []string{"Location", "Retry-After", middleware.RequestIDHeader, TraceIDHeader},
 		AllowCredentials: false,
 		MaxAge:           int((5 * time.Minute).Seconds()),
 	}))

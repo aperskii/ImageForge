@@ -10,7 +10,7 @@
 #   docker build -f deployments/docker/worker.Dockerfile -t imageforge-worker .
 
 # ---------------------------------------------------------------- build -----
-FROM golang:1.24-bookworm AS build
+FROM golang:1.25-bookworm AS build
 
 # libvips-dev brings the headers and the pkg-config file cgo needs to compile
 # govips; pkg-config itself is what finds them.

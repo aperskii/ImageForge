@@ -13,12 +13,15 @@ import (
 	"sync"
 
 	"imageforge/internal/ports"
+	"imageforge/internal/telemetry"
 )
 
-// Compile-time assertion that Queue satisfies the port.
+// Compile-time assertions that Queue satisfies the port and its optional
+// companions.
 var (
-	_ ports.Queue         = (*Queue)(nil)
-	_ ports.DepthReporter = (*Queue)(nil)
+	_ ports.Queue            = (*Queue)(nil)
+	_ ports.DepthReporter    = (*Queue)(nil)
+	_ ports.DeliveryConsumer = (*Queue)(nil)
 )
 
 // ErrClosed is returned when enqueueing onto a closed queue.
@@ -31,7 +34,11 @@ const DefaultBuffer = 1024
 //
 // It is safe for concurrent use by any number of producers and consumers.
 type Queue struct {
-	ch chan string
+	// Deliveries rather than bare identifiers, so a job enqueued inside a
+	// trace reaches its consumer still attached to it. In this process that
+	// could have been done by passing the context along, but carrying the
+	// same W3C headers SQS carries keeps one code path for both queues.
+	ch chan ports.Delivery
 
 	mu     sync.RWMutex
 	closed bool
@@ -43,7 +50,7 @@ func New(buffer int) *Queue {
 	if buffer <= 0 {
 		buffer = DefaultBuffer
 	}
-	return &Queue{ch: make(chan string, buffer)}
+	return &Queue{ch: make(chan ports.Delivery, buffer)}
 }
 
 // Enqueue publishes jobID for processing.
@@ -62,7 +69,7 @@ func (q *Queue) Enqueue(ctx context.Context, jobID string) error {
 	}
 
 	select {
-	case q.ch <- jobID:
+	case q.ch <- ports.Delivery{JobID: jobID, Meta: telemetry.Inject(ctx)}:
 		return nil
 	case <-ctx.Done():
 		return fmt.Errorf("memqueue: enqueue %s: %w", jobID, ctx.Err())
@@ -76,7 +83,30 @@ func (q *Queue) Enqueue(ctx context.Context, jobID string) error {
 // of them, so several consumers share the work rather than each seeing every
 // job.
 func (q *Queue) Consume(ctx context.Context) (<-chan string, error) {
+	deliveries, err := q.ConsumeDeliveries(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	out := make(chan string)
+	go func() {
+		defer close(out)
+		for delivery := range deliveries {
+			select {
+			case out <- delivery.JobID:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return out, nil
+}
+
+// ConsumeDeliveries returns a channel of jobs with the metadata each was
+// enqueued with, and is otherwise identical to Consume.
+func (q *Queue) ConsumeDeliveries(ctx context.Context) (<-chan ports.Delivery, error) {
+	out := make(chan ports.Delivery)
 
 	go func() {
 		defer close(out)
@@ -84,12 +114,12 @@ func (q *Queue) Consume(ctx context.Context) (<-chan string, error) {
 			select {
 			case <-ctx.Done():
 				return
-			case jobID, ok := <-q.ch:
+			case delivery, ok := <-q.ch:
 				if !ok {
 					return
 				}
 				select {
-				case out <- jobID:
+				case out <- delivery:
 				case <-ctx.Done():
 					return
 				}

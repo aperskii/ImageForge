@@ -19,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/aws/aws-sdk-go-v2/otelaws"
 )
 
 // Environment variables read by SettingsFromEnv.
@@ -114,6 +115,12 @@ func Load(ctx context.Context, settings Settings) (aws.Config, error) {
 	if err != nil {
 		return aws.Config{}, fmt.Errorf("awscfg: load: %w", err)
 	}
+
+	// One span per AWS call, on every client built from this configuration.
+	// It is what turns "the job took four seconds" into "three of them were
+	// the S3 GET", and it costs a middleware rather than a call site.
+	otelaws.AppendMiddlewares(&cfg.APIOptions)
+
 	return cfg, nil
 }
 

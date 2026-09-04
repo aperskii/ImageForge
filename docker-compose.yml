@@ -17,6 +17,13 @@ x-aws-env: &aws-env
   IMAGEFORGE_SQS_QUEUE: imageforge-jobs
   IMAGEFORGE_DYNAMODB_TABLE: imageforge-jobs
 
+x-otel-env: &otel-env
+  # Empty unless something sets it. Spans are recorded either way, and their
+  # ids appear in the log either way; this only decides whether they are also
+  # exported. `make dev-tracing` sets it and starts Jaeger alongside.
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+  IMAGEFORGE_ENV: dev
+
 services:
   localstack:
     image: localstack/localstack:3
@@ -77,7 +84,7 @@ services:
     ports:
       - "8080:8080"
     environment:
-      <<: *aws-env
+      <<: [*aws-env, *otel-env]
       IMAGEFORGE_BACKEND: aws
       IMAGEFORGE_ADDR: ":8080"
       # Results are served straight from LocalStack's S3, which the browser
@@ -85,6 +92,11 @@ services:
       IMAGEFORGE_PUBLIC_BASE_URL: http://localhost:4566/imageforge-media
       IMAGEFORGE_CORS_ORIGINS: http://localhost:5173
       IMAGEFORGE_LOG_LEVEL: INFO
+      # The per-client rate limit, overridable so a load test can measure the
+      # pipeline rather than the limiter. Five a second is the default and the
+      # right value for a dev stack.
+      IMAGEFORGE_RATE_LIMIT: ${IMAGEFORGE_RATE_LIMIT:-5}
+      IMAGEFORGE_RATE_BURST: ${IMAGEFORGE_RATE_BURST:-20}
     restart: unless-stopped
 
   worker:
@@ -99,7 +111,7 @@ services:
       # Prometheus metrics and the worker's own health endpoint.
       - "9090:9090"
     environment:
-      <<: *aws-env
+      <<: [*aws-env, *otel-env]
       IMAGEFORGE_BACKEND: aws
       IMAGEFORGE_METRICS_ADDR: ":9090"
       IMAGEFORGE_WORKERS: "4"
@@ -132,6 +144,21 @@ services:
       - sh
       - -c
       - "npm install --no-audit --no-fund && npm run dev -- --host 0.0.0.0"
+    restart: unless-stopped
+
+  # Somewhere for the spans to go, started only by `make dev-tracing`. Without
+  # it the services still record spans and still log trace ids; this is what
+  # turns those ids into a picture. All-in-one keeps traces in memory, which is
+  # the right trade for a development stack and useless for anything else.
+  jaeger:
+    image: jaegertracing/jaeger:2.10.0
+    container_name: imageforge-jaeger
+    profiles: [tracing]
+    ports:
+      # The UI: search by service, or paste a trace id straight from the log.
+      - "16686:16686"
+      # OTLP over HTTP, which is what the exporter in both services speaks.
+      - "4318:4318"
     restart: unless-stopped
 
 volumes:

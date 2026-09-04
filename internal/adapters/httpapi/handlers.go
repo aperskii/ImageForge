@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"imageforge/internal/domain"
 	"imageforge/internal/ports"
@@ -177,6 +179,13 @@ func (a *API) handleUpload(w http.ResponseWriter, r *http.Request) {
 		a.writeUseCaseProblem(w, r, err)
 		return
 	}
+
+	// The job identifier is the one attribute that makes this trace findable
+	// from the outside, and it does not exist until the use case has run.
+	trace.SpanFromContext(r.Context()).SetAttributes(
+		attribute.String("imageforge.job.id", job.ID),
+		attribute.String("imageforge.job.format", job.Transformation.Format.String()),
+	)
 
 	clientID, _ := ClientID(r.Context())
 	a.cfg.Logger.InfoContext(r.Context(), "accepted a job",

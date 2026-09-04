@@ -648,17 +648,16 @@ func TestMiddleware(t *testing.T) {
 		var logged bytes.Buffer
 		logger := slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-		router := New(nil, nil, mustIssuer(t), Config{Logger: logger}).Routes()
-		mux, ok := router.(interface {
-			Get(pattern string, h http.HandlerFunc)
-			ServeHTTP(http.ResponseWriter, *http.Request)
-		})
-		require.True(t, ok, "the router must accept an extra route")
-		mux.Get("/boom", func(http.ResponseWriter, *http.Request) {
+		// The route is mounted on the router itself rather than on what
+		// Routes returns, which is the tracing wrapper. Everything under test
+		// — the recoverer, the request log, the problem response — is the
+		// real stack either way.
+		router := New(nil, nil, mustIssuer(t), Config{Logger: logger}).routes()
+		router.Get("/boom", func(http.ResponseWriter, *http.Request) {
 			panic("deliberate test panic")
 		})
 
-		server := httptest.NewServer(mux)
+		server := httptest.NewServer(withTracing(router))
 		t.Cleanup(server.Close)
 
 		resp, err := http.Get(server.URL + "/boom")

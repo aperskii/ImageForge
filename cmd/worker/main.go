@@ -32,6 +32,7 @@ import (
 	"imageforge/internal/healthcheck"
 	"imageforge/internal/metrics"
 	"imageforge/internal/ports"
+	"imageforge/internal/telemetry"
 	"imageforge/internal/usecase"
 	"imageforge/internal/worker"
 )
@@ -54,13 +55,24 @@ func main() {
 func run(args []string) error {
 	cfg := loadConfig()
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.logLevel}))
+	// The telemetry handler stamps the trace, span and job identifiers from
+	// each record's context onto the record, which is what lets one job be
+	// followed from the API's log into this one.
+	logger := slog.New(telemetry.NewLogHandler(
+		slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.logLevel}),
+	))
 	slog.SetDefault(logger)
 
 	// Signals are trapped before anything is opened, so a Ctrl-C during
 	// startup is still handled by the graceful path.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	tracing, err := telemetry.Setup(ctx, telemetry.ConfigFromEnv("imageforge-worker", version))
+	if err != nil {
+		return err
+	}
+	defer shutdownTracing(logger, tracing)
 
 	set, err := adapters.Open(ctx, cfg.backend, adapters.Config{
 		StorageDir:  cfg.storageDir,
@@ -104,6 +116,7 @@ func run(args []string) error {
 	}
 
 	logger.Info("worker starting",
+		slog.String("version", version),
 		slog.String("backend", set.Name),
 		slog.String("image_backend", imageproc.Backend),
 		slog.String("adapters", set.Description),
@@ -163,21 +176,50 @@ func seed(
 			return fmt.Errorf("seed %q: %w", path, err)
 		}
 
-		job, err := createJob.Execute(ctx, usecase.CreateJobInput{Source: file, Spec: spec})
+		// A span here is what gives the seeded job a trace to belong to. The
+		// API gets one from its server span; on this path nothing else would
+		// start one, and the worker would begin a fresh trace of its own when
+		// it picked the job up.
+		jobCtx, span := telemetry.Start(ctx, "job.seed")
+		job, err := createJob.Execute(jobCtx, usecase.CreateJobInput{Source: file, Spec: spec})
+		telemetry.End(span, err)
+
 		_ = file.Close()
 		if err != nil {
 			return fmt.Errorf("seed %q: %w", path, err)
 		}
 
-		logger.Info("job submitted",
+		logger.InfoContext(jobCtx, "job submitted",
 			slog.String("source", filepath.Base(path)),
 			slog.String("job_id", job.ID))
 	}
 	return nil
 }
 
-// metricsShutdownTimeout bounds the wait for in-flight scrapes to finish.
-const metricsShutdownTimeout = 5 * time.Second
+// version names this build. The container images stamp it with the commit sha
+// through -ldflags "-X main.version=..."; it identifies the build in the
+// startup log and on every span this process records.
+var version = "dev"
+
+// Timeouts applied while stopping.
+const (
+	// metricsShutdownTimeout bounds the wait for in-flight scrapes to finish.
+	metricsShutdownTimeout = 5 * time.Second
+	// tracingShutdownTimeout bounds the final flush of buffered spans.
+	tracingShutdownTimeout = 5 * time.Second
+)
+
+// shutdownTracing flushes whatever spans are still buffered, on a context of
+// its own so a collector that is not answering delays the exit by seconds
+// rather than blocking it.
+func shutdownTracing(logger *slog.Logger, tracing *telemetry.Provider) {
+	ctx, cancel := context.WithTimeout(context.Background(), tracingShutdownTimeout)
+	defer cancel()
+
+	if err := tracing.Shutdown(ctx); err != nil {
+		logger.Warn("flushing the pending spans failed", slog.String("error", err.Error()))
+	}
+}
 
 // config holds the runtime settings, all overridable by environment variable.
 type config struct {

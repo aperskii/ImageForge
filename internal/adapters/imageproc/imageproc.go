@@ -19,8 +19,12 @@ import (
 	"fmt"
 	"io"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"imageforge/internal/domain"
 	"imageforge/internal/ports"
+	"imageforge/internal/telemetry"
 )
 
 // Compile-time assertion that the selected backend satisfies the port.
@@ -114,6 +118,18 @@ func (p *Processor) Process(ctx context.Context, input io.Reader, spec domain.Tr
 		return nil, ctxErr
 	}
 
+	// This span is the one that matters in a job's trace: everything else a
+	// worker does is a network call, and this is the CPU.
+	ctx, span := telemetry.Start(ctx, "image.transform", trace.WithAttributes(
+		attribute.String("imageforge.image.backend", Backend),
+		attribute.String("imageforge.image.format", spec.Format.String()),
+		attribute.Int("imageforge.image.width", spec.Width),
+		attribute.Int("imageforge.image.height", spec.Height),
+		attribute.Int("imageforge.image.quality", spec.Quality),
+	))
+	var err error
+	defer func() { telemetry.End(span, err) }()
+
 	img, err := p.Open(input)
 	if err != nil {
 		return nil, fmt.Errorf("imageproc: open source: %w", err)
@@ -136,8 +152,13 @@ func (p *Processor) Process(ctx context.Context, input io.Reader, spec domain.Tr
 		}
 	}
 
+	// Encoding is the expensive half, so a job whose context has already
+	// expired stops here rather than paying for a result nobody will read.
+	// The assignment to err is what the deferred span end reads, so this
+	// cancellation is recorded rather than closing the span as a success.
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return nil, ctxErr
+		err = ctxErr
+		return nil, err
 	}
 
 	out, err := img.ConvertFormat(spec.Format.String(), spec.Quality)

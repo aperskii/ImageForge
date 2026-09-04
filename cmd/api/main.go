@@ -23,8 +23,14 @@ import (
 	"imageforge/internal/adapters/httpapi"
 	"imageforge/internal/adapters/memqueue"
 	"imageforge/internal/healthcheck"
+	"imageforge/internal/telemetry"
 	"imageforge/internal/usecase"
 )
+
+// version names this build. The container images stamp it with the commit sha
+// through -ldflags "-X main.version=..."; it identifies the build in the
+// startup log and on every span this process records.
+var version = "dev"
 
 // Timeouts applied to the HTTP server and to shutdown.
 const (
@@ -33,6 +39,8 @@ const (
 	writeTimeout      = 60 * time.Second
 	idleTimeout       = 120 * time.Second
 	shutdownTimeout   = 15 * time.Second
+	// tracingShutdownTimeout bounds the final flush of buffered spans.
+	tracingShutdownTimeout = 5 * time.Second
 )
 
 func main() {
@@ -53,13 +61,24 @@ func main() {
 func run() error {
 	cfg := loadConfig()
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.logLevel}))
+	// The telemetry handler stamps the trace, span and job identifiers from
+	// each record's context onto the record, which is what makes one job
+	// greppable across this process and the worker.
+	logger := slog.New(telemetry.NewLogHandler(
+		slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.logLevel}),
+	))
 	slog.SetDefault(logger)
 
 	// Signals are trapped before anything is opened, so a Ctrl-C during
 	// startup is still handled by the graceful path.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	tracing, err := telemetry.Setup(ctx, telemetry.ConfigFromEnv("imageforge-api", version))
+	if err != nil {
+		return err
+	}
+	defer shutdownTracing(logger, tracing)
 
 	set, err := adapters.Open(ctx, cfg.backend, adapters.Config{
 		StorageDir:  cfg.storageDir,
@@ -104,6 +123,7 @@ func run() error {
 	go func() {
 		logger.Info("api listening",
 			slog.String("addr", cfg.addr),
+			slog.String("version", version),
 			slog.String("backend", set.Name),
 			slog.String("adapters", set.Description))
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -281,4 +301,16 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return v
+}
+
+// shutdownTracing flushes whatever spans are still buffered, on a context of
+// its own so a collector that is not answering delays the exit by seconds
+// rather than blocking it.
+func shutdownTracing(logger *slog.Logger, tracing *telemetry.Provider) {
+	ctx, cancel := context.WithTimeout(context.Background(), tracingShutdownTimeout)
+	defer cancel()
+
+	if err := tracing.Shutdown(ctx); err != nil {
+		logger.Warn("flushing the pending spans failed", slog.String("error", err.Error()))
+	}
 }

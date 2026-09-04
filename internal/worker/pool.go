@@ -15,7 +15,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"imageforge/internal/ports"
+	"imageforge/internal/telemetry"
 	"imageforge/internal/usecase"
 )
 
@@ -81,6 +86,18 @@ const (
 	StatusFailed    = "failed"
 	StatusSkipped   = "skipped"
 )
+
+// outcomeOf names what became of a job, for the span and the observer.
+func outcomeOf(err error) string {
+	switch {
+	case errors.Is(err, usecase.ErrJobNotPending):
+		return StatusSkipped
+	case err != nil:
+		return StatusFailed
+	default:
+		return StatusProcessed
+	}
+}
 
 // nopObserver is the default, so the pool never has to check for nil.
 type nopObserver struct{}
@@ -179,7 +196,7 @@ func (p *Pool) Stats() Stats {
 //
 // Run is not reentrant: use one Run per Pool.
 func (p *Pool) Run(ctx context.Context) error {
-	ids, err := p.queue.Consume(ctx)
+	deliveries, err := p.consume(ctx)
 	if err != nil {
 		return fmt.Errorf("worker: consume: %w", err)
 	}
@@ -195,7 +212,7 @@ func (p *Pool) Run(ctx context.Context) error {
 	for i := range p.size {
 		go func(id int) {
 			defer wg.Done()
-			p.work(ctx, jobCtx, id, ids)
+			p.work(ctx, jobCtx, id, deliveries)
 		}(i)
 	}
 
@@ -235,20 +252,51 @@ func (p *Pool) Run(ctx context.Context) error {
 	}
 }
 
-// work pulls identifiers until the queue closes or lifeCtx is canceled.
+// consume opens the queue, preferring the delivery form when the queue offers
+// it.
+//
+// A queue that implements ports.DeliveryConsumer hands over the trace context
+// that traveled with each job. One that does not still works: its jobs simply
+// arrive with no metadata and are traced from here on rather than from the
+// upload that created them.
+func (p *Pool) consume(ctx context.Context) (<-chan ports.Delivery, error) {
+	if consumer, ok := p.queue.(ports.DeliveryConsumer); ok {
+		return consumer.ConsumeDeliveries(ctx)
+	}
+
+	ids, err := p.queue.Consume(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(chan ports.Delivery)
+	go func() {
+		defer close(out)
+		for jobID := range ids {
+			select {
+			case out <- ports.Delivery{JobID: jobID}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out, nil
+}
+
+// work pulls deliveries until the queue closes or lifeCtx is canceled.
 //
 // lifeCtx decides whether to take on more work; jobCtx is what a job runs under
 // and outlives lifeCtx by design.
-func (p *Pool) work(lifeCtx, jobCtx context.Context, workerID int, ids <-chan string) {
+func (p *Pool) work(lifeCtx, jobCtx context.Context, workerID int, deliveries <-chan ports.Delivery) {
 	for {
 		select {
 		case <-lifeCtx.Done():
 			return
-		case jobID, ok := <-ids:
+		case delivery, ok := <-deliveries:
 			if !ok {
 				return
 			}
-			p.handle(jobCtx, workerID, jobID)
+			p.handle(jobCtx, workerID, delivery)
 		}
 	}
 }
@@ -258,7 +306,24 @@ func (p *Pool) work(lifeCtx, jobCtx context.Context, workerID int, ids <-chan st
 // A failing job is logged and counted, never propagated: one bad image must not
 // stop the pool. The use case has already recorded the failure against the job
 // itself, so the state a client polls for is correct either way.
-func (p *Pool) handle(ctx context.Context, workerID int, jobID string) {
+func (p *Pool) handle(ctx context.Context, workerID int, delivery ports.Delivery) {
+	jobID := delivery.JobID
+
+	// Continue the trace the upload started rather than beginning a new one.
+	// This is the join: everything the API logged about this job and
+	// everything logged below share one trace id, across two processes and
+	// however long the job waited in between.
+	ctx = telemetry.Extract(ctx, delivery.Meta)
+	ctx = telemetry.WithJobID(ctx, jobID)
+
+	ctx, span := telemetry.Start(ctx, "job.process",
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(
+			attribute.String("imageforge.job.id", jobID),
+			attribute.Int("imageforge.worker.id", workerID),
+		))
+	defer span.End()
+
 	if p.jobTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, p.jobTimeout)
@@ -268,6 +333,12 @@ func (p *Pool) handle(ctx context.Context, workerID int, jobID string) {
 	started := time.Now()
 	job, err := p.process.Execute(ctx, jobID)
 	elapsed := time.Since(started)
+
+	span.SetAttributes(attribute.String("imageforge.job.outcome", outcomeOf(err)))
+	if err != nil && !errors.Is(err, usecase.ErrJobNotPending) {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
 
 	switch {
 	case errors.Is(err, usecase.ErrJobNotPending):

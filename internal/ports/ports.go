@@ -46,6 +46,32 @@ type Acknowledger interface {
 	Nack(ctx context.Context, jobID string) error
 }
 
+// Delivery is one job handed to a consumer, together with whatever metadata
+// traveled alongside it.
+type Delivery struct {
+	// JobID identifies the job to process.
+	JobID string
+	// Meta holds the small string pairs attached when the job was enqueued:
+	// the W3C trace context, and nothing else so far. It is nil when the
+	// message carried none, which is the normal case for a job enqueued by
+	// something that was not tracing.
+	Meta map[string]string
+}
+
+// DeliveryConsumer is an optional companion to Queue, implemented by queues
+// that can carry metadata beside the job identifier.
+//
+// It exists so a trace can survive the queue. The Queue port moves an
+// identifier and nothing else, which is the right shape for the use cases —
+// they have no business knowing a job arrived with a trace attached. A
+// consumer that does care asserts for this interface and falls back to Consume
+// when it is absent, exactly as it does for Acknowledger.
+type DeliveryConsumer interface {
+	// ConsumeDeliveries behaves as Queue.Consume, but yields the metadata that
+	// arrived with each job as well as its identifier.
+	ConsumeDeliveries(ctx context.Context) (<-chan Delivery, error)
+}
+
 // DepthReporter is an optional companion to Queue, implemented by queues that
 // can say how much work is waiting.
 //

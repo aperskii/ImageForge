@@ -15,6 +15,12 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 
 	// Registered so image.DecodeConfig can inspect the results the pool wrote.
 	_ "image/jpeg"
@@ -771,4 +777,104 @@ func TestNewInstallsANoOpObserver(t *testing.T) {
 	pool := New(nil, nil)
 	require.NotNil(t, pool.observer)
 	assert.NotPanics(t, func() { pool.observer.JobFinished(StatusProcessed, time.Second) })
+}
+
+// TestPoolContinuesTheTraceItWasHandedIsTheWholePoint is the end-to-end check
+// on tracing: a job enqueued inside one span must be processed inside a span
+// belonging to the same trace, even though the two halves are joined only by
+// what the queue carried.
+func TestPoolContinuesTheTraceAcrossTheQueue(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	t.Cleanup(func() { require.NoError(t, provider.Shutdown(context.Background())) })
+
+	otel.SetTracerProvider(provider)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+
+	stack := newStack(t, 4, WithSize(1))
+
+	// The upload half: a span stands in for the API's server span.
+	uploadCtx, uploadSpan := provider.Tracer("test").Start(context.Background(), "upload")
+	job, err := stack.createJob.Execute(uploadCtx, usecase.CreateJobInput{
+		Source: bytes.NewReader(samplePNG(t, 32, 32)),
+		Spec:   domain.TransformationSpec{Width: 16, Format: domain.FormatJPEG, Quality: 80},
+	})
+	require.NoError(t, err)
+	uploadSpan.End()
+
+	// The worker half, in what would be another process entirely.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- stack.pool.Run(ctx) }()
+
+	require.Eventually(t, func() bool {
+		stored, getErr := stack.jobs.Get(context.Background(), job.ID)
+		return getErr == nil && stored.Status == domain.StatusDone
+	}, 10*time.Second, 10*time.Millisecond)
+
+	cancel()
+	require.NoError(t, <-done)
+
+	processing := findSpan(t, recorder, "job.process")
+	assert.Equal(t, uploadSpan.SpanContext().TraceID(), processing.SpanContext().TraceID(),
+		"the worker must continue the trace the upload started")
+	assert.Equal(t, uploadSpan.SpanContext().SpanID(), processing.Parent().SpanID(),
+		"and the upload span must be its parent")
+	assert.Equal(t, trace.SpanKindConsumer, processing.SpanKind())
+
+	// The identifier is what makes the trace findable from a job id alone.
+	assert.Contains(t, processing.Attributes(),
+		attribute.String("imageforge.job.id", job.ID))
+}
+
+// TestPoolTracesAnUntracedJob covers the other path: a queue that carried no
+// trace context still produces a usable span, rather than nothing.
+func TestPoolTracesAnUntracedJob(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	t.Cleanup(func() { require.NoError(t, provider.Shutdown(context.Background())) })
+
+	otel.SetTracerProvider(provider)
+
+	stack := newStack(t, 4, WithSize(1))
+
+	job, err := stack.createJob.Execute(context.Background(), usecase.CreateJobInput{
+		Source: bytes.NewReader(samplePNG(t, 32, 32)),
+		Spec:   domain.TransformationSpec{Width: 16, Format: domain.FormatJPEG, Quality: 80},
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- stack.pool.Run(ctx) }()
+
+	require.Eventually(t, func() bool {
+		stored, getErr := stack.jobs.Get(context.Background(), job.ID)
+		return getErr == nil && stored.Status == domain.StatusDone
+	}, 10*time.Second, 10*time.Millisecond)
+
+	cancel()
+	require.NoError(t, <-done)
+
+	processing := findSpan(t, recorder, "job.process")
+	assert.True(t, processing.SpanContext().TraceID().IsValid())
+	assert.False(t, processing.Parent().IsValid(), "it starts a trace of its own")
+}
+
+// findSpan returns the one recorded span with the given name.
+func findSpan(t *testing.T, recorder *tracetest.SpanRecorder, name string) sdktrace.ReadOnlySpan {
+	t.Helper()
+
+	var found []sdktrace.ReadOnlySpan
+	for _, span := range recorder.Ended() {
+		if span.Name() == name {
+			found = append(found, span)
+		}
+	}
+	require.Len(t, found, 1, "expected exactly one %q span", name)
+	return found[0]
 }

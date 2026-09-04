@@ -10,7 +10,7 @@ BIN_DIR        ?= bin
 
 .DEFAULT_GOAL := build
 
-.PHONY: build test lint run-api run-worker dev dev-down dev-logs images aws-init aws-up test-integration
+.PHONY: build test lint run-api run-worker dev dev-tracing dev-down dev-logs images aws-init aws-up test-integration load-test
 
 ## build: compile the api and worker binaries into $(BIN_DIR)
 build:
@@ -63,3 +63,11 @@ aws-up:
 ## test-integration: run the integration suite against a running LocalStack
 test-integration:
 	$(GO) test -tags integration -count=1 -timeout 10m ./test/integration/...
+
+## dev-tracing: bring up the stack with Jaeger, and export spans to it
+dev-tracing:
+	OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318 $(DOCKER_COMPOSE) --profile tracing up --build
+
+## load-test: drive POST /uploads at rising concurrency (needs k6 and a running stack)
+load-test:
+	k6 run $(K6_FLAGS) test/load/uploads.js
